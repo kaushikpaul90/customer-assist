@@ -2,12 +2,12 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from app.models import (
     answer_question, detect_defect, explain_defect, infer_damage_from_caption, summarize_text, explain_topic,
-    ocr_image_bytes, classify_image_bytes, detect_damage,
+    ocr_image_bytes, classify_image_bytes, detect_damage, transcribe_and_translate_audio, transcribe_audio,
     translate_text, image_caption_bytes
 )
 from app.utils import timeit, record_metric
 
-app = FastAPI(title="CustomerAssist AI", description="AI-powered Customer Service Assistant", version="1.0")
+app = FastAPI(title="Customer Assist AI", description="AI-powered Customer Service Assistant", version="1.0")
 
 # Request models
 class QAReq(BaseModel):
@@ -121,10 +121,10 @@ async def translate(req: TranslateReq):
         text = req.text.strip()
         src_lang = req.src_lang.strip()
         target_lang = req.target_lang.strip()
-        out = translate_text(text=text, src_lang=src_lang, target_lang=target_lang)
+        translated_text = translate_text(text=text, src_lang=src_lang, target_lang=target_lang)
         latency = (timeit()-start)*1000
-        record_metric('/translate', latency, {'out_len': len(out)})
-        return {'translation': out}
+        record_metric('/translate', latency, {'out_len': len(translated_text)})
+        return {'translation': translated_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -176,7 +176,19 @@ async def caption(file: UploadFile = File(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+@app.post("/asr")
+async def asr(file: UploadFile = File(...)):
+    """Transcribe uploaded audio (wav/mp3) to text."""
+    audio_bytes = await file.read()
+    return transcribe_audio(audio_bytes)
+    
+@app.post("/asr-translate")
+async def asr(file: UploadFile = File(...)):
+    """Transcribe and translate uploaded audio (wav/mp3) to English text."""
+    audio_bytes = await file.read()
+    translated_text = transcribe_and_translate_audio(audio_bytes)
+    return {'translation': translated_text}
 
 @app.get("/")
 async def root():

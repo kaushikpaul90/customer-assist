@@ -8,11 +8,13 @@ from PIL import Image
 import io
 import cv2
 import re
+import tempfile
+from langdetect import detect
 # import timm
 # from dotenv import load_dotenv
 
 from app.config import (
-    DAMAGE_DETECTOR, QA_MODEL, SUMMARIZER, EXPLAINER,
+    ASR_MODEL, DAMAGE_DETECTOR, QA_MODEL, SUMMARIZER, EXPLAINER,
     PARAPHRASE_MODEL, TEXT_DAMAGE_CLASSIFIER, TRANSLATOR, IMG_CLASSIFIER,
     IMAGE_CAPTION, OCR_LANGS, DEVICE
 )
@@ -79,6 +81,9 @@ explainer = pipeline(
 #     device_map="auto"
 # )
 
+# ----------------------------
+# Initialize CV Pipelines
+# ----------------------------
 # Image classification (cached)
 img_classifier = pipeline(
     "image-classification",
@@ -105,6 +110,12 @@ damage_text_classifier = pipeline(
     model=TEXT_DAMAGE_CLASSIFIER,
     device=0 if DEVICE == "cuda" else -1
 )
+
+# ----------------------------
+# Initialize ASR Pipelines
+# ----------------------------
+asr_pipeline = pipeline("automatic-speech-recognition", model=ASR_MODEL, return_timestamps=True, device=-1)
+
 
 use_gpu = torch.backends.mps.is_available()
 # OCR reader (easyocr)
@@ -155,7 +166,7 @@ def contains_damage_keywords(text: str) -> bool:
     return any(k in text.lower() for k in damage_keywords)
 
 # ----------------------------
-# NLP Functions
+# NLP Tasks
 # ----------------------------
 def answer_question(context: str, question: str):
     answers = []
@@ -249,13 +260,12 @@ def translate_text(text: str, src_lang: str, target_lang: str):
         device=0 if DEVICE == "cuda" else -1
     )
     prompt = f"{text}"
-    out = translator(prompt, max_length=512, do_sample=True
-    )
+    out = translator(prompt, max_length=512, do_sample=True)
     res = out[0].get("translation_text") or out[0].get("text") or ""
     return clean_text(res)
 
 # ----------------------------
-# Computer Vision Functions
+# Computer Vision Tasks
 # ----------------------------
 def ocr_image_bytes(image_bytes: bytes):
     processed = preprocess_image_for_ocr(image_bytes)
@@ -458,3 +468,33 @@ def explain_defect(image_bytes: bytes,
     caption = processor.decode(output[0], skip_special_tokens=True)
 
     return caption
+
+# --- Speech Recognition Task ---
+
+def transcribe_audio(audio_bytes: bytes):
+    """Convert spoken audio to text using Whisper model."""
+    # Save to temporary WAV for pipeline compatibility
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        result = asr_pipeline(tmp.name)
+    return {"transcription": result["text"]}
+
+
+def transcribe_and_translate_audio(audio_bytes: bytes):
+    """Convert spoken audio to text using Whisper model and translate to English text."""
+    transcribed_text = transcribe_audio(audio_bytes)
+    src_lang, target_lang = detect_source_target_language(transcribed_text["transcription"])
+    translated_text = translate_text(text=transcribed_text["transcription"], src_lang=src_lang, target_lang=target_lang)
+    return translated_text
+
+def detect_source_target_language(transcribed_text: str):
+    """Detect the source and target language of the spoken audio."""
+    transcribed_language_code = detect(transcribed_text)
+    if transcribed_language_code == 'hi':
+        src_lang = 'hin_Deva'
+        target_lang = 'eng_Latn'
+    else:
+        src_lang = 'eng_Latn'
+        target_lang = 'hin_Deva'
+    return src_lang, target_lang

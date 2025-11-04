@@ -18,5 +18,5 @@ accelerate
 python-multipart
 opencv-python-headless
 kernels
-python-dotenv
-timm
+opencv-python
+langdetect

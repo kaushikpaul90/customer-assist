@@ -28,6 +28,7 @@ IMG_CLASSIFIER = "google/vit-base-patch16-224"
 IMAGE_CAPTION = "Salesforce/blip-image-captioning-base"    #"datalab-to/chandra"
 DAMAGE_DETECTOR = "microsoft/resnet-50" #"Marqo/nsfw-image-detection-384"
 TEXT_DAMAGE_CLASSIFIER = "distilbert-base-uncased-finetuned-sst-2-english"    #"mrm8488/codebert2codebert-finetuned-code-defect-detection"
+ASR_MODEL = "openai/whisper-medium"
 
 # OCR
 OCR_LANGS = ["en"]
