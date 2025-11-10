@@ -1,9 +1,20 @@
+"""REST API surface for Customer Assist.
+
+This module defines the FastAPI application and the public endpoints
+used by the demo. Endpoints are thin wrappers that call into
+`app.models` and record simple latency metrics using `app.utils`.
+
+Keep this file light: avoid heavy imports or model initialization here
+so FastAPI's import time remains predictable. Heavy model code
+belongs in `app.models` where it can be refactored into lazy factories.
+"""
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from app.models import (
-    answer_question, detect_defect, explain_defect, infer_damage_from_caption, summarize_text, explain_topic,
-    ocr_image_bytes, classify_image_bytes, detect_damage, transcribe_and_translate_audio, transcribe_audio,
-    translate_text, image_caption_bytes
+    answer_question, detect_defect, summarize_text, explain_topic,
+    ocr_image_bytes, classify_image_bytes, transcribe_and_translate_audio, transcribe_audio,
+    translate_text
 )
 from app.utils import timeit, record_metric
 
@@ -20,10 +31,6 @@ class TextReq(BaseModel):
 class ExplainReq(BaseModel):
     topic: str
     style: str = "detailed"  # options: detailed, step-by-step
-
-# class ParaphraseReq(BaseModel):
-#     text: str
-#     mode: str = 'paraphrase'  # or 'simplify'
 
 class TranslateReq(BaseModel):
     text: str
@@ -64,15 +71,6 @@ async def explain(req: ExplainReq):
         out = explain_topic(req.topic, style=req.style)
         latency = (timeit() - start) * 1000
         record_metric("/explain", latency, {"out_len": len(out)})
-    
-        # # Format output into a proper numbered list if step-by-step
-        # if req.style.lower() == "step-by-step":
-        #     # Format for readable multi-line display
-        #     formatted = out.replace("\\n", "\n") \
-        #                 .replace("Step ", "\nStep ") \
-        #                 .replace("step ", "\nStep ") \
-        #                 .replace(".", ".\n")
-        #     return formatted.strip()
         
         return {'explanation': out}
     except Exception as e:
@@ -94,21 +92,6 @@ async def upload_image(file: UploadFile = File(...)):
         return {"summary": s, "labels": labels}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.post('/paraphrase')
-# async def paraphrase(req: ParaphraseReq):
-#     """
-#     Paraphrase or simplify text.
-#     mode: 'paraphrase' or 'simplify'
-#     """
-#     start = timeit()
-#     try:
-#         out = paraphrase_text(req.text, mode=req.mode)
-#         latency = (timeit()-start)*1000
-#         record_metric('/paraphrase', latency, {'out_len': len(out), 'mode': req.mode})
-#         return {'result': out}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/translate')
 async def translate(req: TranslateReq):
@@ -136,40 +119,11 @@ async def caption(file: UploadFile = File(...)):
     start = timeit()
     try:
         img_bytes = await file.read()
-        
-        # # Step 1: Captioning
-        # caption_result = image_caption_bytes(img_bytes)
-        
-        # # Step 2: Damage detection
-        # # damage_result = detect_damage(img_bytes)
-        # is_damaged_from_caption = infer_damage_from_caption(caption_result["caption"])
-
-        # # Step 3: Get object context (optional for explainability)
-        # # is_damaged_from_object_detection = detect_damage(img_bytes)
-        # is_damaged_from_object_detection = classify_image_bytes(img_bytes)
-
-        # # Step 4: Decide eligibility
-        # is_damaged = is_damaged_from_caption or is_damaged_from_object_detection
-        # eligibility = "Eligible for return" if is_damaged else "Not eligible for return"
-        # latency = (timeit()-start)*1000
-        # record_metric('/caption', latency, {'caption_len': len(caption_result.get('caption',''))})
-
-        # return {
-        #     # "item": cap["caption"],
-        #     "eligibility": eligibility,
-        #     # "latency_ms": round(latency, 2)
-        # }
 
         # Step 1: Detect defects
         detection = detect_defect(img_bytes)
         print("🩻 Detection result:", detection)
 
-        # # Step 2 (optional): Generate explanation if defective
-        # if detection["is_defective"]:
-        #     description = explain_defect(img_bytes)
-        #     print("📝 Explanation:", description)
-        # else:
-        #     print("✅ Product appears to be undamaged.")
         return {
             "detection": detection,
             # "explanation": description if detection["is_defective"] else "No defects detected."

@@ -1,5 +1,14 @@
-# app/models.py
-# import os
+"""app.models
+
+High-level ML helper wrappers used by the Customer Assist API.
+
+This module centralizes lightweight helper functions and a small set of
+pre-initialized Hugging Face `pipeline` objects used by the FastAPI
+endpoints. Note: importing this module will initialize several
+transformers pipelines which may download models and allocate device memory.
+Keep import-time work minimal in production (consider lazy-loading).
+"""
+
 import torch
 from transformers import AutoModelForCausalLM, Blip2ForConditionalGeneration, Blip2Processor, CLIPModel, CLIPProcessor, pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import easyocr
@@ -10,7 +19,6 @@ import cv2
 import re
 import tempfile
 from langdetect import detect
-# import timm
 # from dotenv import load_dotenv
 
 from app.config import (
@@ -25,6 +33,12 @@ from app.config import (
 # ----------------------------
 # Initialize NLP Pipelines
 # ----------------------------
+# The pipelines below are created at import time for convenience. They
+# are convenient for a demo, but they are heavyweight: model downloads,
+# tokenizer initialization and device memory allocation can occur during
+# import. For production or tests consider lazy factories (functions that
+# create pipelines on first call) to speed up cold-starts and reduce
+# resource usage in environments that only run limited endpoints.
 # QA
 qa_pipeline = pipeline(
     "question-answering",
@@ -41,14 +55,6 @@ summarizer = pipeline(
     device=0 if DEVICE == "cuda" else -1
 )
 
-# # Explanation (text2text)
-# explainer = pipeline(
-#     "text2text-generation",
-#     model=EXPLAINER,
-#     tokenizer=EXPLAINER,
-#     device=0 if DEVICE == "cuda" else -1
-# )
-
 # Explanation (text2text)
 explainer = pipeline(
     "text-generation",
@@ -56,30 +62,6 @@ explainer = pipeline(
     model_kwargs={"torch_dtype": torch.bfloat16},
     device_map="auto"
 )
-# Explanation (text2text)
-# explainer = pipeline(
-#     "text-generation",
-#     model=EXPLAINER,
-#     model_kwargs={"torch_dtype": torch.bfloat16},
-#     device_map="auto",
-#     token=HF_KEY
-# )
-
-# # Paraphrase / Simplify (T5)
-# # we'll use a T5 text2text pipeline and control via prompt
-# # paraphraser = pipeline(
-# #     "text2text-generation",
-# #     model=PARAPHRASE_MODEL,
-# #     tokenizer=PARAPHRASE_MODEL,
-# #     device=0 if DEVICE == "cuda" else -1
-# # )
-# paraphraser = pipeline(
-#     "text-generation",
-#     model=PARAPHRASE_MODEL,
-#     tokenizer=PARAPHRASE_MODEL,
-#     torch_dtype="auto",
-#     device_map="auto"
-# )
 
 # ----------------------------
 # Initialize CV Pipelines
@@ -103,7 +85,6 @@ damage_detector = pipeline(
     model=DAMAGE_DETECTOR,
     device=0 if DEVICE == "cuda" else -1
 )
-# damage_detector = timm.create_model("hf_hub:Marqo/nsfw-image-detection-384", pretrained=True)
 
 damage_text_classifier = pipeline(
     "text-classification",
@@ -125,12 +106,41 @@ reader = easyocr.Reader(OCR_LANGS, gpu=use_gpu)
 # Helpers
 # ----------------------------
 def split_text(text, max_words=300):
+    """Yield successive chunks of text limited by `max_words`.
+
+    This is a simple splitter used to avoid sending very long
+    documents to QA/summarization pipelines in a single call.
+
+    Args:
+        text: input string to split.
+        max_words: approximate maximum words per yielded chunk.
+
+    Yields:
+        str: chunk of the original text (<= max_words words).
+    """
+
     words = text.split()
     for i in range(0, len(words), max_words):
         yield " ".join(words[i:i + max_words])
 
 # Basic image preprocessing for OCR
 def preprocess_image_for_ocr(image_bytes: bytes):
+    """Basic image preprocessing for OCR pipelines.
+
+    Converts raw image bytes to a NumPy array in RGB format which
+    `easyocr.Reader` can consume. This function intentionally keeps the
+    transformations small (no binarization or heavy denoising) to be
+    robust across many input images. If you need more aggressive
+    preprocessing (e.g. thresholding) move that logic into a separate
+    preprocessing pipeline and test on sample inputs.
+
+    Args:
+        image_bytes: Raw bytes of the uploaded image file.
+
+    Returns:
+        np.ndarray: RGB image as a NumPy array.
+    """
+
     image_stream = io.BytesIO(image_bytes)
     image = Image.open(image_stream)
 
@@ -138,22 +148,18 @@ def preprocess_image_for_ocr(image_bytes: bytes):
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    # image = np.array(image.convert("L"))
     image_np = np.array(image)
-
     return image_np
-
-    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-    # Apply Gaussian blur to reduce noise
-    # blurred = cv2.GaussianBlur(image, (3, 3), 0)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    # Adaptive thresholding for binarization
-    processed = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY, 31, 2)
-    return processed
 
 # Simple text cleanup
 def clean_text(t: str) -> str:
+    """Normalize and trim whitespace in model-generated text.
+
+    Removes newlines and collapses repeated whitespace so downstream
+    code can rely on a single-line string for display or further
+    processing.
+    """
+
     t = t.replace("\n", " ").strip()
     t = re.sub(r'\s+', ' ', t)
     return t
@@ -169,6 +175,23 @@ def contains_damage_keywords(text: str) -> bool:
 # NLP Tasks
 # ----------------------------
 def answer_question(context: str, question: str):
+    """Answer a question using the QA pipeline over possibly-long context.
+
+    The function will split long context into smaller chunks (using
+    `split_text`) and query the QA pipeline for each chunk. The final
+    answer is chosen by simple majority voting across chunk-level
+    responses. This strategy is lightweight and suitable for short to
+    medium documents. For better accuracy consider a more advanced
+    retrieval + reading pipeline.
+
+    Args:
+        context: Long textual context to search for the answer.
+        question: The question string to answer.
+
+    Returns:
+        dict: A dictionary with keys `question` and `answer`.
+    """
+
     answers = []
     for chunk in split_text(context, 300):
         res = qa_pipeline(question=question, context=chunk)
@@ -180,15 +203,57 @@ def answer_question(context: str, question: str):
     return {"question": question, "answer": final_answer}
 
 def summarize_text(text: str):
-    result = summarizer(text, max_new_tokens=256, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
-    return result[0]["summary_text"]
+    """Summarize a customer service conversation or long text.
+
+    The implementation builds a short prompt to focus the summarizer on
+    the customer's issue and the resolution. The summarizer is called
+    with deterministic decoding parameters for consistent outputs.
+
+    Args:
+        text: The input text to summarize.
+
+    Returns:
+        str: The generated summary.
+    """
+
+    # Structured prompt to guide the model
+    prompt = (
+        "Summarize the following customer service conversation. "
+        "Focus on the customer's issue, agent's response, resolution offered, and any constraints mentioned:\n\n"
+        + text.strip()
+    )
+
+    # Generate summary with deterministic decoding
+    result = summarizer(
+        prompt,
+        max_new_tokens=160,  # Allow more room for nuance
+        do_sample=False,     # Disable sampling for consistency
+        num_beams=4,         # Beam search for better quality
+        early_stopping=True
+    )
+
+    summary = result[0]["summary_text"]
+    return summary
 
 def explain_topic(topic: str, style: str = "detailed"):
+    """Return a concise explanation of `topic`.
+
+    Args:
+        topic: The subject to explain.
+        style: A non-strict hint for the explanation style (e.g.
+            'detailed' or 'step-by-step'). Currently the value is passed
+            through but not used to change the prompt substantially.
+
+    Returns:
+        str: Cleaned explanation text.
+    """
+
     prompt = (
         f"Explain the topic '{topic}' in five to six sentences. "
         f"Include what it is, how it works, and why it matters. "
         f"Use multiple complete sentences and examples if possible."
     )
+    
     out = explainer(
         prompt,
         max_new_tokens=512,
@@ -200,50 +265,6 @@ def explain_topic(topic: str, style: str = "detailed"):
     explanation = out[0].get("generated_text") or out[0].get("text") or ""
     explanation = clean_text(explanation.replace(prompt, ""))
     return explanation
-
-    # tokenizer = AutoTokenizer.from_pretrained(EXPLAINER, use_auth_token=HF_KEY)
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     EXPLAINER,
-    #     torch_dtype=torch.float16,
-    #     device_map="auto",
-    #     use_auth_token=HF_KEY
-    # )
-
-    # inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    # outputs = model.generate(
-    #     **inputs,
-    #     max_new_tokens=30,
-    #     temperature=0.7,
-    #     top_p=0.9,
-    #     do_sample=True
-    # )
-
-    # topic = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # topic = topic.split("Topic:")[-1].strip()
-
-    # return {"topic": topic}
-
-# def paraphrase_text(text: str, mode: str = "paraphrase"):
-#     """
-#     Paraphrase or simplify input text.
-#     mode: 'paraphrase' or 'simplify'
-#     Uses prompt-style calls on a small T5 model.
-#     """
-#     text = text.strip()
-#     if mode == "simplify":
-#         prompt = f"simplify: {text}"
-#     else:
-#         prompt = f"paraphrase: {text}"
-
-#     out = paraphraser(
-#         prompt,
-#         max_length=60,
-#         num_beams=4,
-#         do_sample=False,
-#         repetition_penalty=1.2
-#     )
-#     res = out[0].get("generated_text") or out[0].get("text") or ""
-#     return clean_text(res)
 
 def translate_text(text: str, src_lang: str, target_lang: str):
     """
@@ -268,6 +289,18 @@ def translate_text(text: str, src_lang: str, target_lang: str):
 # Computer Vision Tasks
 # ----------------------------
 def ocr_image_bytes(image_bytes: bytes):
+    """Run OCR on image bytes and return combined plain text.
+
+    Uses `easyocr.Reader` which is initialized at module import with
+    languages from `config.OCR_LANGS`.
+
+    Args:
+        image_bytes: Raw image bytes.
+
+    Returns:
+        dict: {'text': recognized_text} or a message when nothing found.
+    """
+
     processed = preprocess_image_for_ocr(image_bytes)
     texts = reader.readtext(processed, detail=0)
     combined = " ".join(texts).strip()
@@ -275,6 +308,13 @@ def ocr_image_bytes(image_bytes: bytes):
     return {"text": combined if combined else "No English text detected."}
 
 def classify_image_bytes(image_bytes: bytes):
+    """Return top-3 image classification predictions.
+
+    The function uses a pre-initialized `img_classifier` pipeline and
+    returns the top 3 labels with scores as floats for JSON
+    serialization.
+    """
+
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     preds = img_classifier(image)
     top3 = preds[:3]
@@ -291,34 +331,6 @@ def image_caption_bytes(image_bytes: bytes):
     caption = out[0].get("generated_text") or out[0].get("caption") or ""
     caption = clean_text(caption)
     return {"caption": caption}
-
-def detect_damage(image_bytes: bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    preds = damage_detector(image)
-
-    # Example: classifier output [{'label': 'LABEL_123', 'score': 0.98}, ...]
-    # You can refine this logic using fine-tuned models.
-    label = preds[0]['label'].lower()
-    score = preds[0]['score']
-
-    # # simple heuristic for demo
-    # damaged_keywords = ["broken", "damaged", "defect", "crack", "torn"]
-    # is_damaged = any(k in label for k in damaged_keywords)
-
-    is_damaged = contains_damage_keywords(label)
-
-    return is_damaged
-
-def infer_damage_from_caption(caption: str):
-    if contains_damage_keywords(caption):
-        return True
-    # keywords = ["cracked", "broken", "damaged", "defective", "scratched", "torn"]
-    # if any(k in caption.lower() for k in keywords):
-    #     return True
-    sentiment = damage_text_classifier(caption)[0]
-    if sentiment["label"].upper() == "NEGATIVE" and sentiment["score"] > 0.8:
-        return True
-    return False
 
 # -------------------------------------------------------------
 # 1️⃣ Zero-shot Defect Detection using CLIP/SigLIP
@@ -383,20 +395,6 @@ def detect_defect(image_bytes: bytes,
 
     # Map scores
     result = dict(zip(all_labels, probs.tolist()))
-
-    # # Get top prediction
-    # top_label = max(result, key=result.get)
-    # top_prob = result[top_label]
-
-    # # Identify if defective based on top label
-    # is_defective = not any(x in top_label for x in ["brand new", "no defects"]) and top_prob > threshold
-
-    # return {
-    #     "is_defective": is_defective,
-    #     "predicted_label": top_label,
-    #     "confidence": round(top_prob, 3)
-    #     # "scores": {k: round(v, 3) for k, v in result.items()}
-    # }
 
     # Group-wise averages
     avg_good = sum(result[l] for l in good_labels) / len(good_labels)
