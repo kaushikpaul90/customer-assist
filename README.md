@@ -1,4 +1,4 @@
-# CustomerAssisst - Customer Service AI Assistant (Minimal Distribution)
+# CustomerAssist - Customer Service AI Assistant (Minimal Distribution)
 
 This package contains a minimal API demonstrating an customer service focused AI assistant.
 
@@ -21,4 +21,4 @@ This package contains a minimal API demonstrating an customer service focused AI
 3. Test with curl or Postman (examples in the earlier project doc).
 
 ## Colab
-Use the provided `colab/customerassisst_finetune.ipynb` to run fine-tuning on Colab GPU.
+Use the provided `colab/customerAssist_finetune.ipynb` to run fine-tuning on Colab GPU.
