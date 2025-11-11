@@ -469,5 +469,5 @@ def transcribe_and_translate_audio(audio_bytes: bytes):
     """
     transcribed_text = transcribe_audio(audio_bytes)
     src_lang, target_lang = detect_source_target_language(transcribed_text["transcription"])
-    translated_text, _ = translate_text(text=transcribed_text["transcription"], src_lang=src_lang, target_lang=target_lang)
+    translated_text, _, _ = translate_text(text=transcribed_text["transcription"], src_lang=src_lang, target_lang=target_lang)
     return translated_text
