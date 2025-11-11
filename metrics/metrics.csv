@@ -36,3 +36,12 @@ endpoint,latency_ms,metadata,timestamp
 /check-item-return-eligibility,7563.6,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-11 21:42:24
 /audio-transcribe,35076.51,{'transcription_len': 119},2025-11-11 21:44:44
 /audio-transcribe-translate,37796.55,{'translation_len': 104},2025-11-11 21:45:31
+/question-answering,763.37,{'error': 'ValueError'},2025-11-11 23:32:29
+/summarize-text,5094.22,{'summary_len': 300},2025-11-11 23:32:39
+/translate-text,23102.81,{'out_len': 421},2025-11-11 23:33:31
+/check-item-return-eligibility,6937.84,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-11 23:33:45
+/audio-transcribe,35308.59,{'transcription_len': 119},2025-11-11 23:34:25
+/audio-transcribe-translate,39278.06,{'translation_len': 199},2025-11-11 23:35:04
+/question-answering,11046.53,{'error': 'ValueError'},2025-11-11 23:36:51
+/question-answering,84.2,{'answer_len': 48},2025-11-11 23:40:05
+/question-answering,579.94,{'answer_len': 48},2025-11-11 23:51:45

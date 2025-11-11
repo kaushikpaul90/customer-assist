@@ -42,7 +42,7 @@ class TranslateReq(BaseModel):
 @app.get("/llmops/summary")
 async def llmops_summary():
     """
-    Exposes aggregated operational metrics (latency, throughput, error rate)
+    Exposes aggregated operational metrics (latency, throughput, error rate, token usage)
     by reading the logged LLM interactions.
     """
     try:
@@ -68,6 +68,7 @@ async def question_answering(req: QAReq):
     # Variables to track success/failure and output for logging
     out = {}
     p_version = "N/A"
+    token_count = 0
     
     # Determine log content early
     full_prompt = f"Context: {req.context.strip()} | Question: {req.question.strip()}"
@@ -76,6 +77,7 @@ async def question_answering(req: QAReq):
         # 1. Execute the core logic
         out = answer_question(req.context, req.question)
         answer = out.get("answer", "")
+        token_count = out.get("token_count", "")
         
         # 2. Log success
         latency = (timeit() - start) * 1000
@@ -84,11 +86,12 @@ async def question_answering(req: QAReq):
             latency=latency,
             prompt=full_prompt,
             output=answer,
-            metadata={"answer_len": len(answer), "prompt_version": p_version, "success": True}
+            metadata={"answer_len": len(answer), "prompt_version": p_version, "token_count": token_count, "success": True}
         )
         record_metric(endpoint, latency, {"answer_len": len(answer)})
         
         # 3. Return successful response
+        del out["token_count"]
         return out
         
     except Exception as e:
@@ -102,7 +105,7 @@ async def question_answering(req: QAReq):
             latency=latency,
             prompt=full_prompt,
             output="ERROR: " + error_message[:100], # Log partial error message
-            metadata={"answer_len": 0, "prompt_version": p_version, "success": False, "error_type": type(e).__name__}
+            metadata={"answer_len": 0, "prompt_version": p_version,  "token_count": token_count, "success": False, "error_type": type(e).__name__}
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -119,10 +122,11 @@ async def summarize_text_endpoint(req: TextReq):
     s = ""
     prompt = ""
     p_version = "N/A"
+    token_count = 0
 
     try:
         # 1. Execute the core logic
-        s, prompt, p_version = summarize_text(req.text) 
+        s, prompt, p_version, token_count = summarize_text(req.text) 
         
         # 2. Log success
         latency = (timeit() - start) * 1000
@@ -131,7 +135,7 @@ async def summarize_text_endpoint(req: TextReq):
             latency=latency,
             prompt=prompt,
             output=s,
-            metadata={"summary_len": len(s), "prompt_version": p_version, "success": True}
+            metadata={"summary_len": len(s), "prompt_version": p_version, "token_count": token_count, "success": True}
         )
         record_metric(endpoint, latency, {"summary_len": len(s)})
         
@@ -149,7 +153,7 @@ async def summarize_text_endpoint(req: TextReq):
             latency=latency,
             prompt=prompt or req.text[:100], # Log original text if prompt failed to generate
             output="ERROR: " + error_message[:100],
-            metadata={"summary_len": 0, "prompt_version": p_version, "success": False, "error_type": type(e).__name__}
+            metadata={"summary_len": 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__}
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -169,6 +173,7 @@ async def translate_text_endpoint(req: TranslateReq):
     translated_text = ""
     prompt = ""
     p_version = "N/A"
+    token_count = 0
     
     try:
         text = req.text.strip()
@@ -187,7 +192,7 @@ async def translate_text_endpoint(req: TranslateReq):
         mapped_tgt = lang_map.get(target_lang, target_lang)
         
         # 1. Execute the core logic
-        translated_text, prompt, p_version = translate_text(text=text, src_lang=mapped_src, target_lang=mapped_tgt)
+        translated_text, prompt, p_version, token_count = translate_text(text=text, src_lang=mapped_src, target_lang=mapped_tgt)
 
         # 2. Log success
         latency = (timeit() - start) * 1000
@@ -196,7 +201,7 @@ async def translate_text_endpoint(req: TranslateReq):
             latency=latency,
             prompt=prompt,
             output=translated_text,
-            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': len(translated_text), "prompt_version": p_version, "success": True}
+            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': len(translated_text), "prompt_version": p_version, "token_count": token_count, "success": True}
         )
         record_metric(endpoint, latency, {'out_len': len(translated_text)})
         
@@ -214,7 +219,7 @@ async def translate_text_endpoint(req: TranslateReq):
             latency=latency,
             prompt=prompt or req.text[:100], 
             output="ERROR: " + error_message[:100],
-            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "success": False, "error_type": type(e).__name__}
+            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__}
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -256,6 +261,7 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
                 "predicted_label": detection.get("predicted_label"), 
                 "file_size_bytes": len(img_bytes), 
                 "prompt_version": p_version,
+                "token_count": 0, # NEW: Non-LLM endpoint logs 0
                 "success": True
             }
         )
@@ -299,12 +305,13 @@ async def audio_transcribe(file: UploadFile = File(...)):
     file_name = file.filename
     audio_bytes = b''
     p_version = "N/A" # ASR is non-LLM text generation, no prompt versioning used
+    token_count = 0
     
     try:
         audio_bytes = await file.read()
         
         # 1. Execute the core logic
-        transcribed_result = transcribe_audio(audio_bytes)
+        transcribed_result, token_count = transcribe_audio(audio_bytes)
         transcription = transcribed_result.get("transcription", "")
         
         # 2. Log success
@@ -318,6 +325,7 @@ async def audio_transcribe(file: UploadFile = File(...)):
                 "file_name": file_name,
                 "transcription_len": len(transcription),"file_size_bytes": len(audio_bytes),
                 "prompt_version": p_version,
+                "token_count": token_count,
                 "success": True
             }
         )
@@ -342,6 +350,7 @@ async def audio_transcribe(file: UploadFile = File(...)):
                 "transcription_len": 0,"file_size_bytes": len(audio_bytes),
                 "prompt_version": p_version,
                 "success": False,
+                "token_count": token_count,
                 "error_type": type(e).__name__
             }
         )
@@ -361,12 +370,13 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
     file_name = file.filename
     audio_bytes = b''
     p_version = get_prompt_template("translator_prompt")[1] # Get the current version
+    token_count = 0
     
     try:
         audio_bytes = await file.read()
         
         # 1. Execute the core logic
-        translated_text = transcribe_and_translate_audio(audio_bytes)
+        translated_text, token_count = transcribe_and_translate_audio(audio_bytes)
         
         # 2. Log success
         latency = (timeit() - start) * 1000
@@ -380,6 +390,7 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
                 "translation_len": len(translated_text),
                 "prompt_version": p_version,
                 "file_size_bytes": len(audio_bytes),
+                "token_count": token_count,
                 "success": True
             }
         )
@@ -405,6 +416,7 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
                 "translation_len": 0,
                 "prompt_version": p_version,
                 "file_size_bytes": len(audio_bytes),
+                "token_count": token_count,
                 "success": False,
                 "error_type": type(e).__name__
             }

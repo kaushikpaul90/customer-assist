@@ -89,7 +89,7 @@ def aggregate_llmops_metrics() -> dict:
         }
 
     # Data structure to hold metrics
-    data = defaultdict(lambda: {'latencies': [], 'timestamps': [], 'errors': 0})
+    data = defaultdict(lambda: {'latencies': [], 'timestamps': [], 'errors': 0, 'tokens': []})
     all_timestamps = []
     total_requests = 0
 
@@ -99,8 +99,9 @@ def aggregate_llmops_metrics() -> dict:
             endpoint = row['model_task']
             total_requests += 1
             
-            # Error Detection: Use the logged metadata and output prefix
+            # 1. Error Detection: Use the logged metadata and output prefix
             is_error = False
+            metadata = {}
             try:
                 metadata = json.loads(row['metadata'])
                 # Check for the explicit success flag
@@ -114,17 +115,24 @@ def aggregate_llmops_metrics() -> dict:
             if is_error:
                 data[endpoint]['errors'] += 1
             
-            # Only include successful latencies in performance calculations
+            # 2. Only include successful latencies in performance calculations
             # Successful requests will have a 'success': True flag, or simply not 'success': False
             if not is_error:
                 try:
+                    # Latency
                     latency = float(row['latency_ms'])
                     data[endpoint]['latencies'].append(latency)
-                except ValueError:
+                    
+                    # Token Count
+                    token_count = metadata.get('token_count', 0)
+                    if isinstance(token_count, (int, float)) and token_count >= 0:
+                        data[endpoint]['tokens'].append(int(token_count))
+                except (ValueError, json.JSONDecodeError, KeyError, TypeError):
                     # Ignore non-numeric latency, which shouldn't happen for successful calls
+                    # Ignore corrupted rows for latency/token calculations
                     pass
 
-            # Timestamp processing for all requests (successful and failed)
+            # 3. Timestamp processing for all requests (successful and failed)
             try:
                 t = time.strptime(row['timestamp'], "%Y-%m-%d %H:%M:%S")
                 epoch_time = time.mktime(t)
@@ -149,6 +157,7 @@ def aggregate_llmops_metrics() -> dict:
         time_window_sec = 1 
 
     all_latencies = [l for endpoint_data in data.values() for l in endpoint_data['latencies']]
+    all_tokens = [t for endpoint_data in data.values() for t in endpoint_data['tokens']]
     total_errors = sum(d['errors'] for d in data.values())
     
     overall_metrics = {
@@ -158,6 +167,8 @@ def aggregate_llmops_metrics() -> dict:
         "avg_latency_ms": round(np.mean(all_latencies), 2) if all_latencies else 0.0,
         "p50_latency_ms": round(np.percentile(all_latencies, 50), 2) if all_latencies else 0.0,
         "p95_latency_ms": round(np.percentile(all_latencies, 95), 2) if all_latencies else 0.0,
+        "total_tokens": sum(all_tokens), 
+        "avg_tokens_per_request": round(np.mean(all_tokens), 2) if all_tokens else 0.0,
         "time_window_sec": round(time_window_sec, 2),
         "overall_throughput_req_per_sec": round(total_requests / time_window_sec, 2)
     }
@@ -168,6 +179,7 @@ def aggregate_llmops_metrics() -> dict:
         requests = len(d['latencies']) + d['errors'] # Total requests = successful + errors
         errors = d['errors']
         
+        # Calculate endpoint-specific time window
         endpoint_min_time = min(d['timestamps'])
         endpoint_max_time = max(d['timestamps'])
         endpoint_window_sec = endpoint_max_time - endpoint_min_time
@@ -177,6 +189,8 @@ def aggregate_llmops_metrics() -> dict:
         error_rate = round(errors / requests, 4) if requests > 0 else 0.0
 
         if d['latencies'] or requests > 0:
+            tokens = d['tokens']
+
             per_endpoint_metrics[endpoint] = {
                 "requests": requests,
                 "errors": errors,
@@ -184,6 +198,8 @@ def aggregate_llmops_metrics() -> dict:
                 "avg_latency_ms": round(np.mean(d['latencies']), 2) if d['latencies'] else 0.0,
                 "p50_latency_ms": round(np.percentile(d['latencies'], 50), 2) if d['latencies'] else 0.0,
                 "p95_latency_ms": round(np.percentile(d['latencies'], 95), 2) if d['latencies'] else 0.0,
+                "total_tokens": sum(tokens), 
+                "avg_tokens_per_request": round(np.mean(tokens), 2) if tokens else 0.0, 
                 "throughput_req_per_sec": round(requests / endpoint_window_sec, 2)
             }
 

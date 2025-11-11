@@ -10,7 +10,7 @@ Keep import-time work minimal in production (consider lazy-loading).
 """
 
 import torch
-from transformers import CLIPModel, CLIPProcessor, pipeline
+from transformers import AutoTokenizer, CLIPModel, CLIPProcessor, pipeline
 import easyocr
 import numpy as np
 from PIL import Image
@@ -64,6 +64,7 @@ qa_pipeline = pipeline(
     tokenizer=QA_MODEL,
     **QA_PIPELINE_KWARGS
 )
+qa_tokenizer = qa_pipeline.tokenizer
 
 # Summarization Pipeline
 summarizer = pipeline(
@@ -72,6 +73,27 @@ summarizer = pipeline(
     tokenizer=SUMMARIZER,
     **SUMMARIZER_PIPELINE_KWARGS
 )
+summarizer_tokenizer = summarizer.tokenizer
+
+# Note: The original translator pipeline is initialized inside translate_text()
+# due to the need for dynamic src/tgt language codes. We'll load its tokenizer
+# separately for token counting.
+translator_tokenizer = AutoTokenizer.from_pretrained(TRANSLATOR)
+
+# ----------------------------
+# Token Counting Utility
+# ----------------------------
+
+def count_input_tokens(tokenizer, text: str) -> int:
+    """Safely count the number of input tokens for a given text."""
+    try:
+        # Use the tokenizer's encode method which returns a list of token IDs.
+        # Length of this list is the token count.
+        return len(tokenizer.encode(text, return_tensors='pt')[0])
+    except Exception:
+        # Fallback to character count if tokenization fails
+        return len(text) # Log character count as a proxy
+
 
 # ----------------------------
 # NLP Helper Functions
@@ -127,15 +149,24 @@ def answer_question(context: str, question: str):
         dict: A dictionary with keys `question` and `answer`.
     """
 
+    input_text = f"Context: {context.strip()} Question: {question.strip()}"
+    input_token_count = count_input_tokens(qa_tokenizer, input_text)
+    
     answers = []
     for chunk in split_text(context, 300):
         res = qa_pipeline(question=question, context=chunk)
-        # pipeline returns dict with 'answer' key
         answers.append(res.get("answer", ""))
+        
     if not answers:
-        return {"question": question, "answer": ""}
+        return {"question": question, "answer": "", "token_count": 0}
+        
     final_answer = max(set(answers), key=answers.count)
-    return {"question": question, "answer": final_answer}
+    
+    # Simple way to estimate output tokens: tokenize the final answer
+    output_token_count = count_input_tokens(qa_tokenizer, final_answer)
+    total_token_count = input_token_count + output_token_count
+
+    return {"question": question, "answer": final_answer, "token_count": total_token_count}
 
 
 def summarize_text(text: str):
@@ -152,23 +183,25 @@ def summarize_text(text: str):
         tuple: (generated_summary_str, full_prompt_str, prompt_version_str)
     """
 
-    # LLMOPS: Fetch the active prompt template and version
     template, version = get_prompt_template("summarizer_prompt")
-
-    # Structured prompt to guide the model
     prompt = template + text.strip()
+    
+    input_token_count = count_input_tokens(summarizer_tokenizer, prompt)
 
-    # Generate summary with deterministic decoding
     result = summarizer(
         prompt,
-        max_new_tokens=160,  # Allow more room for nuance
-        do_sample=False,     # Disable sampling for consistency
-        num_beams=4,         # Beam search for better quality
+        max_new_tokens=160,
+        do_sample=False,
+        num_beams=4,
         early_stopping=True
     )
 
     summary = result[0]["summary_text"]
-    return summary, prompt, version # LLMOPS: Return prompt and version
+    
+    output_token_count = count_input_tokens(summarizer_tokenizer, summary)
+    total_token_count = input_token_count + output_token_count
+
+    return summary, prompt, version, total_token_count
 
 
 def translate_text(text: str, src_lang: str, target_lang: str):
@@ -183,9 +216,9 @@ def translate_text(text: str, src_lang: str, target_lang: str):
         tuple: (translated_text_str, full_prompt_str, prompt_version_str)
     """
 
-    # LLMOPS: Fetch the active prompt template and version
     template, version = get_prompt_template("translator_prompt")
     
+    # Pipeline initialized dynamically (retains dynamic language support)
     translator = pipeline(
         TASK_TRANSLATION,
         model=TRANSLATOR,
@@ -194,11 +227,18 @@ def translate_text(text: str, src_lang: str, target_lang: str):
         tgt_lang=target_lang,
         device=0 if DEVICE == "cuda" else -1
     )
-    # The prompt for translation is just the input text itself using v1 template
+    
     prompt = template.format(text=text)
+    
+    input_token_count = count_input_tokens(translator_tokenizer, prompt)
+
     out = translator(prompt, max_length=512, do_sample=True)
     res = out[0].get("translation_text") or out[0].get("text") or ""
-    return clean_text(res), prompt, version # LLMOPS: Return prompt and version
+    
+    output_token_count = count_input_tokens(translator_tokenizer, res)
+    total_token_count = input_token_count + output_token_count
+
+    return clean_text(res), prompt, version, total_token_count
 
 # ==============================================================================
 # 2. COMPUTER VISION PIPELINES & FUNCTIONS
@@ -411,6 +451,8 @@ def detect_defect(image_bytes: bytes,
 
 # Automatic Speech Recognition Pipeline (Whisper)
 asr_pipeline = pipeline(TASK_ASR, model=ASR_MODEL, **ASR_PIPELINE_KWARGS)
+# ASR Tokenizer for token counting
+asr_tokenizer = asr_pipeline.tokenizer
 
 # ----------------------------
 # Audio Helper Functions
@@ -423,14 +465,24 @@ def transcribe_audio(audio_bytes: bytes):
         audio_bytes: Raw audio file bytes (WAV, MP3, etc.).
 
     Returns:
-        dict: {'transcription': str} containing the recognized speech text.
+        tuple: (dict: {'transcription': str}, total_token_count) containing the recognized speech text and token count.
     """
     # Save to temporary WAV for pipeline compatibility
     with tempfile.NamedTemporaryFile() as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
         result = asr_pipeline(tmp.name)
-    return {"transcription": result["text"]}
+    
+    transcription = result["text"]
+    
+    # Token Counting for ASR
+    # ASR is primarily an output-token counting task. We'll use the ASR
+    # tokenizer to count the output transcription tokens. The input audio
+    # itself isn't tokenized like text.
+    output_token_count = count_input_tokens(asr_tokenizer, transcription)
+    
+    # Updated to return the token count
+    return {"transcription": transcription}, output_token_count
 
 
 def detect_source_target_language(transcribed_text: str):
@@ -465,9 +517,23 @@ def transcribe_and_translate_audio(audio_bytes: bytes):
         audio_bytes: Raw audio file bytes.
 
     Returns:
-        str: Translated text.
+        tuple: (translated_text_str, total_token_count).
     """
-    transcribed_text = transcribe_audio(audio_bytes)
-    src_lang, target_lang = detect_source_target_language(transcribed_text["transcription"])
-    translated_text, _, _ = translate_text(text=transcribed_text["transcription"], src_lang=src_lang, target_lang=target_lang)
-    return translated_text
+
+    #Step 1: Transcribe Audio (Returns result dict and ASR token count)
+    transcribed_result, asr_token_count = transcribe_audio(audio_bytes)
+    transcribed_text = transcribed_result["transcription"]
+    
+    # Step 2: Detect Language
+    src_lang, target_lang = detect_source_target_language(transcribed_text)
+    
+    # Step 3: Translate Text (Returns translated text, prompt, version, and NMT token count)
+    translated_text, _, _, nmt_token_count = translate_text(
+        text=transcribed_text, src_lang=src_lang, target_lang=target_lang
+    )
+    
+    # Aggregate total tokens from both steps
+    total_token_count = asr_token_count + nmt_token_count
+    
+    # Updated to return the total token count
+    return translated_text, total_token_count
