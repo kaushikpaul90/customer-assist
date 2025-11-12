@@ -240,6 +240,33 @@ def translate_text(text: str, src_lang: str, target_lang: str):
 
     return clean_text(res), prompt, version, total_token_count
 
+def auto_grade_response(endpoint: str, output: str) -> tuple[float, str]:
+    """
+    Simulates an automated quality check on the model output based on endpoint type.
+    This is used for immediate, automated quality logging.
+
+    Returns: (quality_score, feedback_notes)
+    """
+    score = 1.0 # Default high score
+    notes = "Automated check successful."
+    
+    # Rule 1: Penalize very short or empty output for core LLM tasks
+    if endpoint in ["/summarize-text", "/question-answering", "/translate-text"] and len(output.strip()) < 10:
+        score = 0.2
+        notes = "Output too brief or empty; likely failed core task."
+    
+    # Rule 2: Moderate penalty for over-verbosity
+    elif len(output) > 1000 and endpoint not in ["/question-answering"]:
+        score = 0.7
+        notes = "Response was overly verbose (>1000 chars)."
+
+    # Rule 3: High score for successful transcription/translation chains
+    elif endpoint in ["/audio-transcribe", "/audio-transcribe-translate"] and len(output.strip()) > 1:
+        score = 0.9
+        notes = "Transcription/Translation output detected."
+
+    return score, notes
+
 # ==============================================================================
 # 2. COMPUTER VISION PIPELINES & FUNCTIONS
 # ==============================================================================

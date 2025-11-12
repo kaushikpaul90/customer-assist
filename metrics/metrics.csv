@@ -1,47 +1,7 @@
 endpoint,latency_ms,metadata,timestamp
-/translate-text,43939.25,{'out_len': 423},2025-11-11 17:53:20
-/summarize-text,10303.38,{'summary_len': 308},2025-11-11 18:29:45
-/question-answering,629.61,{'answer_len': 48},2025-11-11 18:31:03
-/question-answering,84.23,{'answer_len': 48},2025-11-11 18:32:30
-/check-item-return-eligibility,7097.42,"{'eligible': 'not_eligible', 'confidence': None}",2025-11-11 18:33:03
-/audio-transcribe,35869.25,{'transcription_len': 119},2025-11-11 18:34:50
-/audio-transcribe-translate,47790.68,{'translation_len': 94},2025-11-11 18:38:16
-/check-item-return-eligibility,6556.6,"{'eligible': True, 'predicted_label': 'a broken product'}",2025-11-11 18:46:36
-/question-answering,726.2,{'answer_len': 48},2025-11-11 19:49:15
-/summarize-text,4196.23,{'summary_len': 308},2025-11-11 19:49:50
-/translate-text,12180.75,{'out_len': 421},2025-11-11 19:50:20
-/check-item-return-eligibility,7459.19,"{'eligible': True, 'predicted_label': 'a broken product'}",2025-11-11 19:50:33
-/audio-transcribe,35311.14,{'transcription_len': 119},2025-11-11 19:51:25
-/audio-transcribe-translate,41520.68,{'translation_len': 159},2025-11-11 20:22:07
-/audio-transcribe,30003.89,{'transcription_len': 119},2025-11-11 20:27:02
-/check-item-return-eligibility,6991.09,"{'eligible': True, 'predicted_label': 'a broken product'}",2025-11-11 20:27:18
-/translate-text,12030.7,{'out_len': 421},2025-11-11 20:27:36
-/summarize-text,7386.65,{'summary_len': 308},2025-11-11 20:27:49
-/question-answering,693.2,{'answer_len': 48},2025-11-11 20:27:55
-/audio-transcribe-translate,42562.14,{'error': 'ValueError'},2025-11-11 20:56:36
-/audio-transcribe-translate,38040.76,{'error': 'ValueError'},2025-11-11 20:58:27
-/question-answering,712.25,{'answer_len': 48},2025-11-11 21:12:45
-/summarize-text,4722.7,{'summary_len': 300},2025-11-11 21:13:32
-/translate-text,11976.61,{'out_len': 419},2025-11-11 21:14:04
-/check-item-return-eligibility,7052.74,"{'eligible': True, 'predicted_label': 'a broken product'}",2025-11-11 21:14:30
-/audio-transcribe,35457.48,{'transcription_len': 119},2025-11-11 21:15:11
-/audio-transcribe-translate,39039.71,{'translation_len': 166},2025-11-11 21:15:50
-/question-answering,669.09,{'answer_len': 48},2025-11-11 21:17:24
-/summarize-text,7791.29,{'summary_len': 300},2025-11-11 21:18:13
-/translate-text,12081.56,{'out_len': 421},2025-11-11 21:19:02
-/check-item-return-eligibility,6898.63,"{'eligible': True, 'predicted_label': 'a chipped product'}",2025-11-11 21:32:03
-/check-item-return-eligibility,3918.68,"{'eligible': True, 'predicted_label': 'a chipped product'}",2025-11-11 21:32:06
-/check-item-return-eligibility,3883.76,"{'eligible': True, 'predicted_label': 'a chipped product'}",2025-11-11 21:32:10
-/check-item-return-eligibility,3768.02,"{'eligible': True, 'predicted_label': 'a chipped product'}",2025-11-11 21:32:14
-/check-item-return-eligibility,7563.6,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-11 21:42:24
-/audio-transcribe,35076.51,{'transcription_len': 119},2025-11-11 21:44:44
-/audio-transcribe-translate,37796.55,{'translation_len': 104},2025-11-11 21:45:31
-/question-answering,763.37,{'error': 'ValueError'},2025-11-11 23:32:29
-/summarize-text,5094.22,{'summary_len': 300},2025-11-11 23:32:39
-/translate-text,23102.81,{'out_len': 421},2025-11-11 23:33:31
-/check-item-return-eligibility,6937.84,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-11 23:33:45
-/audio-transcribe,35308.59,{'transcription_len': 119},2025-11-11 23:34:25
-/audio-transcribe-translate,39278.06,{'translation_len': 199},2025-11-11 23:35:04
-/question-answering,11046.53,{'error': 'ValueError'},2025-11-11 23:36:51
-/question-answering,84.2,{'answer_len': 48},2025-11-11 23:40:05
-/question-answering,579.94,{'answer_len': 48},2025-11-11 23:51:45
+/question-answering,734.3,{'answer_len': 48},2025-11-12 10:27:27
+/summarize-text,4863.69,{'summary_len': 300},2025-11-12 10:27:32
+/translate-text,13579.72,{'out_len': 419},2025-11-12 10:27:45
+/check-item-return-eligibility,7654.28,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-12 10:27:53
+/audio-transcribe,47565.09,{'transcription_len': 119},2025-11-12 10:28:41
+/audio-transcribe-translate,55012.94,{'translation_len': 146},2025-11-12 10:29:36

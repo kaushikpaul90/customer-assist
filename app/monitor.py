@@ -2,12 +2,13 @@
 
 This module captures the inputs, outputs, and metadata for key LLM calls
 to enable downstream monitoring and analysis (e.g., detecting prompt drift,
-analyzing failure modes, or logging cost/latency).
+analyzing failure modes, or logging cost/latency, and model quality).
 """
 
 import csv
 import json
 import time
+import uuid 
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -15,7 +16,7 @@ import numpy as np
 # Setup logging file
 monitor_file = Path("metrics/llm_monitor.csv")
 monitor_file.parent.mkdir(parents=True, exist_ok=True)
-HEADER = ["timestamp", "model_task", "latency_ms", "prompt", "output", "metadata"]
+HEADER = ["timestamp", "transaction_id", "model_task", "latency_ms", "prompt", "output", "metadata", "quality_score", "feedback_notes"]
 
 
 def _get_active_model_version(task_name: str) -> str:
@@ -28,7 +29,6 @@ def _get_active_model_version(task_name: str) -> str:
         return "summarizer/v1"
     elif task_name == "/translate-text":
         return "translator/v1"
-    # Add other tasks here as needed
     return task_name
 
 
@@ -38,6 +38,9 @@ def log_llm_interaction(
     prompt: str,
     output: str,
     metadata: dict = None,
+    transaction_id: str = None,
+    quality_score: float = None, 
+    feedback_notes: str = ""
 ):
     """
     Logs a single LLM interaction row to a CSV file for monitoring.
@@ -48,27 +51,43 @@ def log_llm_interaction(
         prompt: The full text prompt sent to the LLM.
         output: The full text response from the LLM.
         metadata: Optional dict for extra info (e.g., user ID, token count).
+        transaction_id: Unique ID for the interaction.
+        quality_score: Automated quality score (0.0 to 1.0).
+        feedback_notes: Automated feedback.
     """
     metadata = metadata or {}
+    
+    # Generate ID if not provided (should be provided by main.py)
+    if transaction_id is None:
+        # Fallback in case main.py didn't set it (but main.py should)
+        transaction_id = str(uuid.uuid4())
     
     # Add model version to metadata for traceability
     metadata["model_version"] = _get_active_model_version(endpoint)
 
     row = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "transaction_id": transaction_id, 
         "model_task": endpoint,
         "latency_ms": round(latency, 2),
-        "prompt": prompt.replace('\n', ' ').strip(), # Single-line cleanup for CSV
+        "prompt": prompt.replace('\n', ' ').strip(), 
         "output": output.replace('\n', ' ').strip(),
-        "metadata": json.dumps(metadata)
+        "metadata": json.dumps(metadata),
+        "quality_score": str(quality_score) if quality_score is not None else "", # Convert score to string
+        "feedback_notes": feedback_notes.replace('\n', ' ').strip() # Sanitize notes
     }
 
     new_file = not monitor_file.exists()
+    # Ensure fieldnames uses the full HEADER
     with open(monitor_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=HEADER)
         if new_file:
             writer.writeheader()
         writer.writerow(row)
+        
+    return transaction_id
+
+
 
 # -------------------------------------------------------------
 # LLMOPS: Metric Aggregation
@@ -76,9 +95,7 @@ def log_llm_interaction(
 
 def aggregate_llmops_metrics() -> dict:
     """
-    Reads the llm_monitor.csv and calculates operational metrics.
-    Metrics include total requests, error rate, latency percentiles (p50, p95),
-    and throughput.
+    Reads the llm_monitor.csv and calculates operationaland quality metrics.
     """
     if not monitor_file.exists():
         return {
@@ -89,27 +106,36 @@ def aggregate_llmops_metrics() -> dict:
         }
 
     # Data structure to hold metrics
-    data = defaultdict(lambda: {'latencies': [], 'timestamps': [], 'errors': 0, 'tokens': []})
+    data = defaultdict(lambda: {'latencies': [], 'timestamps': [], 'errors': 0, 'tokens': [], 'quality_scores': []})
     all_timestamps = []
     total_requests = 0
+    all_quality_scores = [] 
 
     with open(monitor_file, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+        # Use DictReader without specifying fieldnames; it will use the first row as the header
+        reader = csv.DictReader(f) 
+        
+        # Determine if the 'transaction_id' and 'quality_score' columns exist (for backward compatibility)
+        fieldnames = reader.fieldnames if reader.fieldnames else []
+        has_transaction_id = 'transaction_id' in fieldnames
+        has_quality_score = 'quality_score' in fieldnames
+
         for row in reader:
-            endpoint = row['model_task']
+            endpoint = row.get('model_task')
+            if not endpoint: continue # Skip malformed rows
+                
             total_requests += 1
             
             # 1. Error Detection: Use the logged metadata and output prefix
             is_error = False
             metadata = {}
             try:
-                metadata = json.loads(row['metadata'])
+                metadata = json.loads(row.get('metadata', '{}'))
                 # Check for the explicit success flag
                 if metadata.get('success') is False:
                     is_error = True
             except (json.JSONDecodeError, KeyError):
-                # Fallback: Check if the output starts with "ERROR:"
-                if row['output'].strip().startswith("ERROR:"):
+                if row.get('output', '').strip().startswith("ERROR:"):
                     is_error = True
 
             if is_error:
@@ -117,7 +143,7 @@ def aggregate_llmops_metrics() -> dict:
             
             # 2. Only include successful latencies in performance calculations
             # Successful requests will have a 'success': True flag, or simply not 'success': False
-            if not is_error:
+            if not is_error and row.get('latency_ms'):
                 try:
                     # Latency
                     latency = float(row['latency_ms'])
@@ -130,9 +156,20 @@ def aggregate_llmops_metrics() -> dict:
                 except (ValueError, json.JSONDecodeError, KeyError, TypeError):
                     # Ignore non-numeric latency, which shouldn't happen for successful calls
                     # Ignore corrupted rows for latency/token calculations
-                    pass
-
-            # 3. Timestamp processing for all requests (successful and failed)
+                    pass 
+                    
+            # 3. Quality Score Extraction (Safely access the column)
+            if has_quality_score:
+                quality_str = row.get('quality_score')
+                if quality_str:
+                    try:
+                        score = float(quality_str)
+                        data[endpoint]['quality_scores'].append(score)
+                        all_quality_scores.append(score)
+                    except ValueError:
+                        pass 
+                    
+            # 4. Timestamp processing for all requests (successful and failed)
             try:
                 t = time.strptime(row['timestamp'], "%Y-%m-%d %H:%M:%S")
                 epoch_time = time.mktime(t)
@@ -169,6 +206,7 @@ def aggregate_llmops_metrics() -> dict:
         "p95_latency_ms": round(np.percentile(all_latencies, 95), 2) if all_latencies else 0.0,
         "total_tokens": sum(all_tokens), 
         "avg_tokens_per_request": round(np.mean(all_tokens), 2) if all_tokens else 0.0,
+        "avg_quality_score": round(np.mean(all_quality_scores), 4) if all_quality_scores else 0.0, 
         "time_window_sec": round(time_window_sec, 2),
         "overall_throughput_req_per_sec": round(total_requests / time_window_sec, 2)
     }
@@ -190,6 +228,7 @@ def aggregate_llmops_metrics() -> dict:
 
         if d['latencies'] or requests > 0:
             tokens = d['tokens']
+            quality_scores = d['quality_scores']
 
             per_endpoint_metrics[endpoint] = {
                 "requests": requests,
@@ -200,6 +239,7 @@ def aggregate_llmops_metrics() -> dict:
                 "p95_latency_ms": round(np.percentile(d['latencies'], 95), 2) if d['latencies'] else 0.0,
                 "total_tokens": sum(tokens), 
                 "avg_tokens_per_request": round(np.mean(tokens), 2) if tokens else 0.0, 
+                "avg_quality_score": round(np.mean(quality_scores), 4) if quality_scores else 0.0, 
                 "throughput_req_per_sec": round(requests / endpoint_window_sec, 2)
             }
 

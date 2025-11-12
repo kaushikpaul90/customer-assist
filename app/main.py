@@ -2,20 +2,18 @@
 
 This module defines the FastAPI application and the public endpoints
 used by the demo. Endpoints are thin wrappers that call into
-`app.models` and record simple latency metrics using `app.utils`.
-
-Keep this file light: avoid heavy imports or model initialization here
-so FastAPI's import time remains predictable. Heavy model code
-belongs in `app.models` where it can be refactored into lazy factories.
+`app.models` and record metrics using `app.monitor` and `app.utils`.
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+import uuid
 from app.models import (
-    answer_question, detect_defect, summarize_text, transcribe_and_translate_audio, transcribe_audio, translate_text, get_prompt_template
+    answer_question, detect_defect, summarize_text, transcribe_and_translate_audio, 
+    transcribe_audio, translate_text, get_prompt_template, auto_grade_response
 )
 from app.utils import timeit, record_metric
-from app.monitor import log_llm_interaction, aggregate_llmops_metrics
+from app.monitor import log_llm_interaction, aggregate_llmops_metrics 
 
 app = FastAPI(title="Customer Assist AI", description="AI-powered Customer Service Assistant", version="1.0")
 
@@ -36,13 +34,14 @@ class TranslateReq(BaseModel):
     src_lang: str
     target_lang: str
 
+
 # -------------------------------------------------------------
 # LLMOPS: Operational Metrics Endpoint
 # -------------------------------------------------------------
 @app.get("/llmops/summary")
 async def llmops_summary():
     """
-    Exposes aggregated operational metrics (latency, throughput, error rate, token usage)
+    Exposes aggregated operational metrics (latency, throughput, error rate, token usage, and quality score)
     by reading the logged LLM interactions.
     """
     try:
@@ -56,7 +55,7 @@ async def llmops_summary():
 
 
 # -------------------------------------------------------------
-# LLMOPS: Robust Error Logging Implementation
+# Core Model Endpoints (Updated with transaction_id)
 # -------------------------------------------------------------
 
 @app.post("/question-answering")
@@ -67,11 +66,18 @@ async def question_answering(req: QAReq):
     
     # Variables to track success/failure and output for logging
     out = {}
+    answer = ""
     p_version = "N/A"
     token_count = 0
     
     # Determine log content early
     full_prompt = f"Context: {req.context.strip()} | Question: {req.question.strip()}"
+    transaction_id = str(uuid.uuid4())
+    
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
+
 
     try:
         # 1. Execute the core logic
@@ -79,6 +85,9 @@ async def question_answering(req: QAReq):
         answer = out.get("answer", "")
         token_count = out.get("token_count", "")
         
+        # 1a. AUTO-GRADE RESPONSE
+        quality_score, feedback_notes = auto_grade_response(endpoint, answer)
+
         # 2. Log success
         latency = (timeit() - start) * 1000
         log_llm_interaction(
@@ -86,12 +95,16 @@ async def question_answering(req: QAReq):
             latency=latency,
             prompt=full_prompt,
             output=answer,
-            metadata={"answer_len": len(answer), "prompt_version": p_version, "token_count": token_count, "success": True}
+            transaction_id=transaction_id,
+            metadata={"answer_len": len(answer), "prompt_version": p_version, "token_count": token_count, "success": True},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"answer_len": len(answer)})
         
         # 3. Return successful response
         del out["token_count"]
+        out["transaction_id"] = transaction_id
         return out
         
     except Exception as e:
@@ -99,13 +112,19 @@ async def question_answering(req: QAReq):
         latency = (timeit() - start) * 1000
         error_message = str(e)
         
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}" 
+
         # 2. Log failure
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency,
             prompt=full_prompt,
-            output="ERROR: " + error_message[:100], # Log partial error message
-            metadata={"answer_len": 0, "prompt_version": p_version,  "token_count": token_count, "success": False, "error_type": type(e).__name__}
+            output="ERROR: " + error_message[:100],
+            transaction_id=transaction_id,
+            metadata={"answer_len": 0, "prompt_version": p_version,  "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -123,11 +142,19 @@ async def summarize_text_endpoint(req: TextReq):
     prompt = ""
     p_version = "N/A"
     token_count = 0
+    transaction_id = str(uuid.uuid4())
+    
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
 
     try:
         # 1. Execute the core logic
         s, prompt, p_version, token_count = summarize_text(req.text) 
         
+        # 1a. AUTO-GRADE RESPONSE
+        quality_score, feedback_notes = auto_grade_response(endpoint, s)
+
         # 2. Log success
         latency = (timeit() - start) * 1000
         log_llm_interaction(
@@ -135,25 +162,34 @@ async def summarize_text_endpoint(req: TextReq):
             latency=latency,
             prompt=prompt,
             output=s,
-            metadata={"summary_len": len(s), "prompt_version": p_version, "token_count": token_count, "success": True}
+            transaction_id=transaction_id,
+            metadata={"summary_len": len(s), "prompt_version": p_version, "token_count": token_count, "success": True},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"summary_len": len(s)})
         
         # 3. Return successful response
-        return {"summary": s}
+        return {"summary": s, "transaction_id": transaction_id}
         
     except Exception as e:
         # 1. Capture error details
         latency = (timeit() - start) * 1000
         error_message = str(e)
         
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+
         # 2. Log failure
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency,
-            prompt=prompt or req.text[:100], # Log original text if prompt failed to generate
+            prompt=prompt or req.text[:100],
             output="ERROR: " + error_message[:100],
-            metadata={"summary_len": 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__}
+            transaction_id=transaction_id,
+            metadata={"summary_len": 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -174,7 +210,12 @@ async def translate_text_endpoint(req: TranslateReq):
     prompt = ""
     p_version = "N/A"
     token_count = 0
+    transaction_id = str(uuid.uuid4())
     
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
+
     try:
         text = req.text.strip()
         src_lang = req.src_lang.strip()
@@ -194,6 +235,9 @@ async def translate_text_endpoint(req: TranslateReq):
         # 1. Execute the core logic
         translated_text, prompt, p_version, token_count = translate_text(text=text, src_lang=mapped_src, target_lang=mapped_tgt)
 
+        # 1a. AUTO-GRADE RESPONSE
+        quality_score, feedback_notes = auto_grade_response(endpoint, translated_text)
+
         # 2. Log success
         latency = (timeit() - start) * 1000
         log_llm_interaction(
@@ -201,25 +245,34 @@ async def translate_text_endpoint(req: TranslateReq):
             latency=latency,
             prompt=prompt,
             output=translated_text,
-            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': len(translated_text), "prompt_version": p_version, "token_count": token_count, "success": True}
+            transaction_id=transaction_id,
+            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': len(translated_text), "prompt_version": p_version, "token_count": token_count, "success": True},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {'out_len': len(translated_text)})
         
         # 3. Return successful response
-        return {'translation': translated_text}
+        return {'translation': translated_text, "transaction_id": transaction_id}
     
     except Exception as e:
         # 1. Capture error details
         latency = (timeit() - start) * 1000
         error_message = str(e)
         
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+
         # 2. Log failure
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency,
             prompt=prompt or req.text[:100], 
             output="ERROR: " + error_message[:100],
-            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__}
+            transaction_id=transaction_id,
+            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -238,16 +291,26 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
     detection = {}
     file_name = file.filename
     content_type = file.content_type
-    p_version = "N/A" # Non-LLM endpoint
+    p_version = "N/A" 
+    transaction_id = str(uuid.uuid4())
+    img_bytes = b''
+    
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
     
     try:
         img_bytes = await file.read()
 
         # 1. Execute the core logic
         detection = detect_defect(img_bytes)
-        print("🩻 Detection result:", detection)
+        print("Detection result:", detection)
         
         eligibility = detection.get("eligible_for_return")
+        
+        # 1a. AUTO-GRADE RESPONSE (Simple pass/fail based on core output)
+        quality_score = 1.0 if eligibility in [True, False] else 0.0
+        feedback_notes = f"Detection complete. Eligible: {eligibility}"
         
         # 2. Log success
         latency = (timeit() - start) * 1000
@@ -256,18 +319,22 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
             latency=latency,
             prompt=f"Image file uploaded: {file_name} ({content_type})",
             output=str(detection),
+            transaction_id=transaction_id,
             metadata={
                 "eligible": eligibility, 
                 "predicted_label": detection.get("predicted_label"), 
                 "file_size_bytes": len(img_bytes), 
                 "prompt_version": p_version,
-                "token_count": 0, # NEW: Non-LLM endpoint logs 0
+                "token_count": 0,
                 "success": True
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"eligible": eligibility, "predicted_label": detection.get("predicted_label")})
 
         # 3. Return successful response
+        detection["transaction_id"] = transaction_id
         return detection
     
     except Exception as e:
@@ -275,12 +342,16 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
         latency = (timeit() - start) * 1000
         error_message = str(e)
         
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+
         # 2. Log failure
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency,
             prompt=f"Image file uploaded: {file_name} ({content_type})",
             output="ERROR: " + error_message[:100],
+            transaction_id=transaction_id,
             metadata={
                 "eligible": False, 
                 "predicted_label": "error", 
@@ -288,7 +359,9 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
                 "prompt_version": p_version,
                 "success": False,
                 "error_type": type(e).__name__
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -306,7 +379,12 @@ async def audio_transcribe(file: UploadFile = File(...)):
     audio_bytes = b''
     p_version = "N/A" # ASR is non-LLM text generation, no prompt versioning used
     token_count = 0
+    transaction_id = str(uuid.uuid4())
     
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
+
     try:
         audio_bytes = await file.read()
         
@@ -314,6 +392,9 @@ async def audio_transcribe(file: UploadFile = File(...)):
         transcribed_result, token_count = transcribe_audio(audio_bytes)
         transcription = transcribed_result.get("transcription", "")
         
+        # 1a. AUTO-GRADE RESPONSE
+        quality_score, feedback_notes = auto_grade_response(endpoint, transcription)
+
         # 2. Log success
         latency = (timeit() - start) * 1000
         log_llm_interaction(
@@ -321,17 +402,21 @@ async def audio_transcribe(file: UploadFile = File(...)):
             latency=latency,
             prompt=f"Audio file uploaded: {file_name}",
             output=transcription,
+            transaction_id=transaction_id,
             metadata={
                 "file_name": file_name,
                 "transcription_len": len(transcription),"file_size_bytes": len(audio_bytes),
                 "prompt_version": p_version,
                 "token_count": token_count,
                 "success": True
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"transcription_len": len(transcription)})
         
         # 3. Return successful response
+        transcribed_result["transaction_id"] = transaction_id
         return transcribed_result
     
     except Exception as e:
@@ -339,12 +424,16 @@ async def audio_transcribe(file: UploadFile = File(...)):
         latency = (timeit() - start) * 1000
         error_message = str(e)
         
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+
         # 2. Log failure
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency,
             prompt=f"Audio file uploaded: {file_name}",
             output="ERROR: " + error_message[:100],
+            transaction_id=transaction_id,
             metadata={
                 "file_name": file_name,
                 "transcription_len": 0,"file_size_bytes": len(audio_bytes),
@@ -352,7 +441,9 @@ async def audio_transcribe(file: UploadFile = File(...)):
                 "success": False,
                 "token_count": token_count,
                 "error_type": type(e).__name__
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
@@ -371,13 +462,21 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
     audio_bytes = b''
     p_version = get_prompt_template("translator_prompt")[1] # Get the current version
     token_count = 0
+    transaction_id = str(uuid.uuid4())
     
+    # Initialize quality variables
+    quality_score = 0.0
+    feedback_notes = "Not evaluated."
+
     try:
         audio_bytes = await file.read()
         
         # 1. Execute the core logic
         translated_text, token_count = transcribe_and_translate_audio(audio_bytes)
         
+        # 1a. AUTO-GRADE RESPONSE
+        quality_score, feedback_notes = auto_grade_response(endpoint, translated_text)
+
         # 2. Log success
         latency = (timeit() - start) * 1000
         log_llm_interaction(
@@ -385,6 +484,7 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
             latency=latency,
             prompt=f"Audio file uploaded for ASR and Translation: {file_name}",
             output=translated_text,
+            transaction_id=transaction_id,
             metadata={
                 "file_name": file_name,
                 "translation_len": len(translated_text),
@@ -392,18 +492,23 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
                 "file_size_bytes": len(audio_bytes),
                 "token_count": token_count,
                 "success": True
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
 
         record_metric(endpoint, latency, {"translation_len": len(translated_text)})
         
         # 3. Return successful response
-        return {'translation': translated_text}
+        return {'translation': translated_text, "transaction_id": transaction_id}
     
     except Exception as e:
         # 1. Capture error details
         latency = (timeit() - start) * 1000
         error_message = str(e)
+
+        # 1a. Log failure (Set minimal score on error)
+        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
 
         # 2. Log failure
         log_llm_interaction(
@@ -411,6 +516,7 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
             latency=latency,
             prompt=f"Audio file uploaded for ASR and Translation: {file_name}",
             output="ERROR: " + error_message[:100],
+            transaction_id=transaction_id,
             metadata={
                 "file_name": file_name,
                 "translation_len": 0,
@@ -419,7 +525,9 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
                 "token_count": token_count,
                 "success": False,
                 "error_type": type(e).__name__
-            }
+            },
+            quality_score=quality_score,
+            feedback_notes=feedback_notes
         )
         record_metric(endpoint, latency, {"error": type(e).__name__})
 
