@@ -9,9 +9,13 @@ import csv
 import json
 import time
 import uuid 
+import logging
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
+
+# Setup logger for structured logging
+logger = logging.getLogger("llm_monitor")
 
 # Setup logging file
 monitor_file = Path("metrics/llm_monitor.csv")
@@ -29,6 +33,13 @@ def _get_active_model_version(task_name: str) -> str:
         return "summarizer/v1"
     elif task_name == "/translate-text":
         return "translator/v1"
+    elif task_name == "/check-item-return-eligibility":
+        return "defect_detector/v1"
+    elif task_name == "/audio-transcribe":
+        return "asr_model/v1"
+    elif task_name == "/audio-transcribe-translate":
+        # A combined task, we'll use a custom label
+        return "asr_translator/v1"
     return task_name
 
 
@@ -43,7 +54,8 @@ def log_llm_interaction(
     feedback_notes: str = ""
 ):
     """
-    Logs a single LLM interaction row to a CSV file for monitoring.
+    Logs a single LLM interaction row to a CSV file for monitoring AND
+    logs a structured message to the Python logger.
 
     Args:
         endpoint: The API endpoint that triggered the LLM (e.g., '/question-answering').
@@ -63,8 +75,29 @@ def log_llm_interaction(
         transaction_id = str(uuid.uuid4())
     
     # Add model version to metadata for traceability
-    metadata["model_version"] = _get_active_model_version(endpoint)
+    model_version = _get_active_model_version(endpoint)
+    metadata["model_version"] = model_version
 
+    # -----------------------------------------------
+    # 1. Structured Python Logger Output (JSON via python-json-logger in main.py)
+    # -----------------------------------------------
+    # Use the logger to output a structured message
+    log_data = {
+        "transaction_id": transaction_id, 
+        "model_task": endpoint,
+        "latency_ms": round(latency, 2),
+        "quality_score": quality_score,
+        "success": metadata.get("success", True),
+        **metadata # Merge metadata fields directly (e.g., token_count, prompt_version)
+    }
+    
+    # Log an INFO message with the structured data.
+    # The actual JSON formatting is handled by the logger configuration in main.py.
+    logger.info("LLM interaction completed", extra={'json_fields': log_data})
+    
+    # -----------------------------------------------
+    # 2. CSV Monitor Output (Original implementation)
+    # -----------------------------------------------
     row = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "transaction_id": transaction_id, 
@@ -86,7 +119,6 @@ def log_llm_interaction(
         writer.writerow(row)
         
     return transaction_id
-
 
 
 # -------------------------------------------------------------
@@ -181,7 +213,7 @@ def aggregate_llmops_metrics() -> dict:
     # 1. Overall Metrics Calculation
     if total_requests == 0:
         return {
-            "status": "No complete data entries found.",
+            "status": "No data yet.",
             "total_requests": 0,
             "overall_throughput_req_per_sec": 0.0,
             "per_endpoint_metrics": {}

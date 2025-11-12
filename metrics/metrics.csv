@@ -1,7 +1,0 @@
-endpoint,latency_ms,metadata,timestamp
-/question-answering,734.3,{'answer_len': 48},2025-11-12 10:27:27
-/summarize-text,4863.69,{'summary_len': 300},2025-11-12 10:27:32
-/translate-text,13579.72,{'out_len': 419},2025-11-12 10:27:45
-/check-item-return-eligibility,7654.28,"{'eligible': True, 'predicted_label': 'a damaged product'}",2025-11-12 10:27:53
-/audio-transcribe,47565.09,{'transcription_len': 119},2025-11-12 10:28:41
-/audio-transcribe-translate,55012.94,{'translation_len': 146},2025-11-12 10:29:36

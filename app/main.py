@@ -8,13 +8,75 @@ used by the demo. Endpoints are thin wrappers that call into
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import uuid
+import logging
+from pythonjsonlogger.json import JsonFormatter
+from prometheus_client import Counter, Histogram, generate_latest
+from starlette.responses import Response
+from app.config import LOG_LEVEL
 from app.models import (
     answer_question, detect_defect, summarize_text, transcribe_and_translate_audio, 
     transcribe_audio, translate_text, get_prompt_template, auto_grade_response
 )
-from app.utils import timeit, record_metric
-from app.monitor import log_llm_interaction, aggregate_llmops_metrics 
+from app.utils import timeit
+from app.monitor import log_llm_interaction, aggregate_llmops_metrics
 
+# -------------------------------------------------------------
+# 1. LOGGING SETUP: Use JSON formatting
+# -------------------------------------------------------------
+logger = logging.getLogger('llm_monitor')
+logger.setLevel(LOG_LEVEL)
+
+# Console handler setup for JSON output
+handler = logging.StreamHandler()
+# Use JsonFormatter to output structured data
+formatter = JsonFormatter('%(levelname)s %(asctime)s %(name)s %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+# Prevent duplicate logs from root logger if configured
+logger.propagate = False
+
+# -------------------------------------------------------------
+# 2. PROMETHEUS METRICS SETUP
+# -------------------------------------------------------------
+
+# COUNTER: Total LLM calls by endpoint and status (success/failure)
+LLM_CALLS = Counter(
+    'llm_calls_total', 
+    'Total number of LLM calls, labeled by endpoint and status.',
+    ['endpoint', 'status', 'model_version']
+)
+
+# COUNTER: Total errors by endpoint and error type
+MODEL_ERRORS = Counter(
+    'llm_model_errors_total', 
+    'Total number of LLM model errors, labeled by endpoint and error type.',
+    ['endpoint', 'error_type']
+)
+
+# HISTOGRAM: Latency distribution of LLM calls (in seconds)
+REQUEST_LATENCY = Histogram(
+    'llm_request_latency_seconds', 
+    'Latency of LLM requests in seconds.',
+    ['endpoint', 'model_version'],
+    # Buckets are commonly in seconds (0.01s to 10s)
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float('inf')) 
+)
+
+# Helper function to get the model version label consistent with monitor.py
+def get_model_label(endpoint: str) -> str:
+    """Provides the Prometheus model version label."""
+    if endpoint == "/question-answering": return "qa_model/v1"
+    if endpoint == "/summarize-text": return "summarizer/v1"
+    if endpoint == "/translate-text": return "translator/v1"
+    if endpoint == "/check-item-return-eligibility": return "defect_detector/v1"
+    if endpoint == "/audio-transcribe": return "asr_model/v1"
+    if endpoint == "/audio-transcribe-translate": return "asr_translator/v1"
+    return "unknown"
+
+
+# -------------------------------------------------------------
+# 3. FASTAPI APPLICATION SETUP
+# -------------------------------------------------------------
 app = FastAPI(title="Customer Assist AI", description="AI-powered Customer Service Assistant", version="1.0")
 
 # Request models
@@ -34,9 +96,16 @@ class TranslateReq(BaseModel):
     src_lang: str
     target_lang: str
 
+# -------------------------------------------------------------
+# 4. PROMETHEUS ENDPOINT
+# -------------------------------------------------------------
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Exposes Prometheus metrics."""
+    return Response(generate_latest(), media_type="text/plain")
 
 # -------------------------------------------------------------
-# LLMOPS: Operational Metrics Endpoint
+# LLMOPS: Operational Metrics Endpoint (CSV-based)
 # -------------------------------------------------------------
 @app.get("/llmops/summary")
 async def llmops_summary():
@@ -50,12 +119,12 @@ async def llmops_summary():
     except Exception as e:
         # NOTE: This endpoint should not fail the overall application.
         # If the monitoring file is corrupted, we log that fact.
-        print(f"Error reading metrics file: {e}")
+        logger.error(f"Failed to aggregate metrics: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to aggregate metrics: {str(e)}")
 
 
 # -------------------------------------------------------------
-# Core Model Endpoints (Updated with transaction_id)
+# Core Model Endpoints (Updated with Prometheus & JSON Logging)
 # -------------------------------------------------------------
 
 @app.post("/question-answering")
@@ -77,7 +146,9 @@ async def question_answering(req: QAReq):
     # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
-
+    
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
 
     try:
         # 1. Execute the core logic
@@ -88,11 +159,13 @@ async def question_answering(req: QAReq):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, answer)
 
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=full_prompt,
             output=answer,
             transaction_id=transaction_id,
@@ -100,7 +173,9 @@ async def question_answering(req: QAReq):
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"answer_len": len(answer)})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
         # 3. Return successful response
         del out["token_count"]
@@ -109,24 +184,29 @@ async def question_answering(req: QAReq):
         
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
         
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}" 
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}" 
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=full_prompt,
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
-            metadata={"answer_len": 0, "prompt_version": p_version,  "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            metadata={"answer_len": 0, "prompt_version": p_version,  "token_count": token_count, "success": False, "error_type": error_type},
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)
@@ -147,6 +227,10 @@ async def summarize_text_endpoint(req: TextReq):
     # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
+    
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
+
 
     try:
         # 1. Execute the core logic
@@ -155,11 +239,13 @@ async def summarize_text_endpoint(req: TextReq):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, s)
 
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=prompt,
             output=s,
             transaction_id=transaction_id,
@@ -167,31 +253,38 @@ async def summarize_text_endpoint(req: TextReq):
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"summary_len": len(s)})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
         # 3. Return successful response
         return {"summary": s, "transaction_id": transaction_id}
         
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
         
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=prompt or req.text[:100],
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
-            metadata={"summary_len": 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            metadata={"summary_len": 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": error_type},
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)
@@ -215,6 +308,9 @@ async def translate_text_endpoint(req: TranslateReq):
     # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
+    
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
 
     try:
         text = req.text.strip()
@@ -238,11 +334,13 @@ async def translate_text_endpoint(req: TranslateReq):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, translated_text)
 
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=prompt,
             output=translated_text,
             transaction_id=transaction_id,
@@ -250,31 +348,38 @@ async def translate_text_endpoint(req: TranslateReq):
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {'out_len': len(translated_text)})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
         # 3. Return successful response
         return {'translation': translated_text, "transaction_id": transaction_id}
     
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
         
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=prompt or req.text[:100], 
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
-            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": type(e).__name__},
+            metadata={"src": mapped_src, "tgt": mapped_tgt, 'out_len': 0, "prompt_version": p_version, "token_count": token_count, "success": False, "error_type": error_type},
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)
@@ -299,24 +404,30 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
+    
     try:
         img_bytes = await file.read()
 
         # 1. Execute the core logic
         detection = detect_defect(img_bytes)
-        print("Detection result:", detection)
-        
+        # print("Detection result:", detection) # Replaced with logger
+        logger.info("Detection result: %s", detection, extra={'json_fields': {"transaction_id": transaction_id}})
+
         eligibility = detection.get("eligible_for_return")
         
         # 1a. AUTO-GRADE RESPONSE (Simple pass/fail based on core output)
         quality_score = 1.0 if eligibility in [True, False] else 0.0
         feedback_notes = f"Detection complete. Eligible: {eligibility}"
         
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Image file uploaded: {file_name} ({content_type})",
             output=str(detection),
             transaction_id=transaction_id,
@@ -331,7 +442,9 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"eligible": eligibility, "predicted_label": detection.get("predicted_label")})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Return successful response
         detection["transaction_id"] = transaction_id
@@ -339,31 +452,37 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
     
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
         
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Image file uploaded: {file_name} ({content_type})",
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
             metadata={
                 "eligible": False, 
                 "predicted_label": "error", 
-                "file_size_bytes": 0, 
+                "file_size_bytes": len(img_bytes), 
                 "prompt_version": p_version,
                 "success": False,
-                "error_type": type(e).__name__
+                "token_count": 0,
+                "error_type": error_type
             },
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)
@@ -384,6 +503,9 @@ async def audio_transcribe(file: UploadFile = File(...)):
     # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
+    
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
 
     try:
         audio_bytes = await file.read()
@@ -395,11 +517,13 @@ async def audio_transcribe(file: UploadFile = File(...)):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, transcription)
 
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Audio file uploaded: {file_name}",
             output=transcription,
             transaction_id=transaction_id,
@@ -413,7 +537,9 @@ async def audio_transcribe(file: UploadFile = File(...)):
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"transcription_len": len(transcription)})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
         # 3. Return successful response
         transcribed_result["transaction_id"] = transaction_id
@@ -421,16 +547,18 @@ async def audio_transcribe(file: UploadFile = File(...)):
     
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
         
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Audio file uploaded: {file_name}",
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
@@ -440,12 +568,15 @@ async def audio_transcribe(file: UploadFile = File(...)):
                 "prompt_version": p_version,
                 "success": False,
                 "token_count": token_count,
-                "error_type": type(e).__name__
+                "error_type": error_type
             },
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)
@@ -467,6 +598,9 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
     # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
+    
+    # Get model version for Prometheus labels
+    model_version = get_model_label(endpoint)
 
     try:
         audio_bytes = await file.read()
@@ -477,11 +611,13 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, translated_text)
 
-        # 2. Log success
-        latency = (timeit() - start) * 1000
+        # 2. Log success & Prometheus
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
+        
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Audio file uploaded for ASR and Translation: {file_name}",
             output=translated_text,
             transaction_id=transaction_id,
@@ -497,23 +633,27 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
             feedback_notes=feedback_notes
         )
 
-        record_metric(endpoint, latency, {"translation_len": len(translated_text)})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
         # 3. Return successful response
         return {'translation': translated_text, "transaction_id": transaction_id}
     
     except Exception as e:
         # 1. Capture error details
-        latency = (timeit() - start) * 1000
+        latency_sec = timeit() - start
+        latency_ms = latency_sec * 1000
         error_message = str(e)
+        error_type = type(e).__name__
 
         # 1a. Log failure (Set minimal score on error)
-        quality_score, feedback_notes = 0.0, f"System Failure: {type(e).__name__}"
+        quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
-        # 2. Log failure
+        # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
-            latency=latency,
+            latency=latency_ms,
             prompt=f"Audio file uploaded for ASR and Translation: {file_name}",
             output="ERROR: " + error_message[:100],
             transaction_id=transaction_id,
@@ -524,12 +664,15 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
                 "file_size_bytes": len(audio_bytes),
                 "token_count": token_count,
                 "success": False,
-                "error_type": type(e).__name__
+                "error_type": error_type
             },
             quality_score=quality_score,
             feedback_notes=feedback_notes
         )
-        record_metric(endpoint, latency, {"error": type(e).__name__})
+        # Record Prometheus Metrics
+        LLM_CALLS.labels(endpoint=endpoint, status='failure', model_version=model_version).inc()
+        MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
         # 3. Raise HTTPException to return the error to the client
         raise HTTPException(status_code=500, detail=error_message)

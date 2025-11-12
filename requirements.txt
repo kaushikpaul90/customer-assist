@@ -20,3 +20,5 @@ opencv-python-headless
 kernels
 opencv-python
 langdetect
+python-json-logger
+prometheus_client

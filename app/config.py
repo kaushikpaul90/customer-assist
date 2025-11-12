@@ -6,6 +6,11 @@ Paths) so callers can import them without triggering heavy work.
 """
 
 import torch
+import logging
+
+# --- LOGGING CONFIGURATION ---
+LOG_FORMAT = '%(levelname)s %(asctime)s %(name)s %(message)s'
+LOG_LEVEL = logging.INFO
 
 # --- LLMOPS: Simple Model Registry ---
 # Define a dictionary for each model family to manage versions.
