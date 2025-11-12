@@ -30,7 +30,6 @@ from app.config import (
     DEVICE,
     TASK_QA,
     TASK_SUMMARIZATION,
-    TASK_TEXT_GENERATION,
     TASK_IMAGE_CLASSIFICATION,
     TASK_IMAGE_CAPTION,
     TASK_TRANSLATION,
@@ -42,6 +41,7 @@ from app.config import (
     ASR_PIPELINE_KWARGS,
     get_prompt_template
 )
+from app.utils import retry_with_backoff
 
 # ==============================================================================
 # 1. NLP PIPELINES & FUNCTIONS
@@ -130,7 +130,7 @@ def clean_text(t: str) -> str:
     t = re.sub(r'\s+', ' ', t)
     return t
 
-
+@retry_with_backoff(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
 def answer_question(context: str, question: str):
     """Answer a question using the QA pipeline over possibly-long context.
 
@@ -168,7 +168,7 @@ def answer_question(context: str, question: str):
 
     return {"question": question, "answer": final_answer, "token_count": total_token_count}
 
-
+@retry_with_backoff(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
 def summarize_text(text: str):
     """Summarize a customer service conversation or long text.
 
@@ -203,7 +203,7 @@ def summarize_text(text: str):
 
     return summary, prompt, version, total_token_count
 
-
+@retry_with_backoff(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
 def translate_text(text: str, src_lang: str, target_lang: str):
     """Translate input text to target language.
 
@@ -384,7 +384,7 @@ def detect_defect(image_bytes: bytes,
         top_threshold: Confidence threshold for top defective label.
 
     Returns:
-        dict: {'is_defective': bool, 'confidence': float}
+        dict: {'is_defective': bool, 'predicted_label': str, 'eligible_for_return': bool}
     """
 
     # Load model & processor
@@ -485,6 +485,7 @@ asr_tokenizer = asr_pipeline.tokenizer
 # Audio Helper Functions
 # ----------------------------
 
+@retry_with_backoff(max_retries=3, initial_delay=1.0, backoff_factor=2.0)
 def transcribe_audio(audio_bytes: bytes):
     """Convert spoken audio to text using Whisper model.
 
@@ -555,6 +556,7 @@ def transcribe_and_translate_audio(audio_bytes: bytes):
     src_lang, target_lang = detect_source_target_language(transcribed_text)
     
     # Step 3: Translate Text (Returns translated text, prompt, version, and NMT token count)
+    # The inner translate_text call is already decorated with retry_with_backoff
     translated_text, _, _, nmt_token_count = translate_text(
         text=transcribed_text, src_lang=src_lang, target_lang=target_lang
     )

@@ -7,8 +7,10 @@ used by the demo. Endpoints are thin wrappers that call into
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 import uuid
 import logging
+import json
 from pythonjsonlogger.json import JsonFormatter
 from prometheus_client import Counter, Histogram, generate_latest
 from starlette.responses import Response
@@ -17,8 +19,16 @@ from app.models import (
     answer_question, detect_defect, summarize_text, transcribe_and_translate_audio, 
     transcribe_audio, translate_text, get_prompt_template, auto_grade_response
 )
-from app.utils import timeit
+from app.utils import timeit, GLOBAL_RATE_LIMITER, RESPONSE_CACHE
 from app.monitor import log_llm_interaction, aggregate_llmops_metrics
+
+# --- COST CONTROL CONSTANTS ---
+MAX_RESPONSE_LENGTH = 1500 # Max characters allowed in a response (e.g., for summarization)
+MAX_INPUT_TOKEN_COUNT = 1000 # Max tokens allowed in a prompt/input before rejection
+MAX_TEXT_INPUT_CHAR_COUNT = 4000 # Max characters allowed for text inputs (Added for consistency)
+MAX_IMAGE_FILE_SIZE = 5 * 1024 * 1024 # 5MB limit for images (Added for consistency)
+MAX_AUDIO_FILE_SIZE = 10 * 1024 * 1024 # 10MB limit for audio (Added for consistency)
+
 
 # -------------------------------------------------------------
 # 1. LOGGING SETUP: Use JSON formatting
@@ -119,36 +129,48 @@ async def llmops_summary():
     except Exception as e:
         # NOTE: This endpoint should not fail the overall application.
         # If the monitoring file is corrupted, we log that fact.
-        logger.error(f"Failed to aggregate metrics: {str(e)}", exc_info=True)
+        logger.error(f"Failed to aggregate metrics: {str(e)}", exc_info=True) 
         raise HTTPException(status_code=500, detail=f"Failed to aggregate metrics: {str(e)}")
 
 
 # -------------------------------------------------------------
-# Core Model Endpoints (Updated with Prometheus & JSON Logging)
+# Core Model Endpoints
 # -------------------------------------------------------------
 
 @app.post("/question-answering")
 async def question_answering(req: QAReq):
     """Question answering endpoint (long-context support)."""
     endpoint = "/question-answering"
-    start = timeit()
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
+    full_prompt = f"Context: {req.context.strip()} Question: {req.question.strip()}"
     
-    # Variables to track success/failure and output for logging
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    # --- Cost Control: Input Size Limit Check ---
+    if len(full_prompt) > MAX_TEXT_INPUT_CHAR_COUNT * 2: # Context + Question can be longer
+        raise HTTPException(status_code=413, detail=f"Input text size exceeds the maximum limit (approx. {MAX_TEXT_INPUT_CHAR_COUNT * 2} characters).")
+
+
+    # --- Resilience: Caching Check ---
+    cache_key = f"{endpoint}:{req.context}:{req.question}"
+    cached_response = RESPONSE_CACHE.get(cache_key)
+    if cached_response:
+        logger.info("Response served from cache.", extra={'json_fields': {"transaction_id": transaction_id, "cache_hit": True, "model_task": endpoint}})
+        return JSONResponse(
+            content={"answer": cached_response, "transaction_id": transaction_id},
+            headers={"X-Cache-Status": "HIT"}
+        )
+        
+    start = timeit()
     out = {}
     answer = ""
     p_version = "N/A"
     token_count = 0
-    
-    # Determine log content early
-    full_prompt = f"Context: {req.context.strip()} | Question: {req.question.strip()}"
-    transaction_id = str(uuid.uuid4())
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
-    
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
 
     try:
         # 1. Execute the core logic
@@ -158,6 +180,12 @@ async def question_answering(req: QAReq):
         
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, answer)
+        
+        # --- Cost Control: Response Size Limit Check ---
+        if len(answer) > MAX_RESPONSE_LENGTH:
+             answer = answer[:MAX_RESPONSE_LENGTH] + "..." # Truncate response
+             quality_score = min(quality_score, 0.8)
+             feedback_notes = "Response truncated due to size limit."
 
         # 2. Log success & Prometheus
         latency_sec = timeit() - start
@@ -177,11 +205,17 @@ async def question_answering(req: QAReq):
         LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
-        # 3. Return successful response
+        # 3. Cache and Return successful response
+        RESPONSE_CACHE.set(cache_key, answer) # Cache the successful answer
         del out["token_count"]
         out["transaction_id"] = transaction_id
-        return out
+        return JSONResponse(
+            content=out,
+            headers={"X-Cache-Status": "MISS"}
+        )
         
+    except HTTPException:
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -191,7 +225,7 @@ async def question_answering(req: QAReq):
         
         # 1a. Log failure (Set minimal score on error)
         quality_score, feedback_notes = 0.0, f"System Failure: {error_type}" 
-
+        
         # 2. Log failure & Prometheus
         log_llm_interaction(
             endpoint=endpoint,
@@ -208,30 +242,48 @@ async def question_answering(req: QAReq):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/summarize-text")
 async def summarize_text_endpoint(req: TextReq):
     """Text summarization endpoint."""
     endpoint = "/summarize-text"
-    start = timeit()
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
+    
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
 
+    # --- Cost Control: Input Size Limit Check (Simplified check using char length) ---
+    if len(req.text) > MAX_TEXT_INPUT_CHAR_COUNT: 
+        raise HTTPException(status_code=413, detail=f"Input text size exceeds the maximum limit (approx. {MAX_TEXT_INPUT_CHAR_COUNT} characters).")
+
+
+    # --- Resilience: Caching Check ---
+    cache_key = f"{endpoint}:{req.text}"
+    cached_response = RESPONSE_CACHE.get(cache_key)
+    if cached_response:
+        logger.info("Response served from cache.", extra={'json_fields': {"transaction_id": transaction_id, "cache_hit": True, "model_task": endpoint}})
+        return JSONResponse(
+            content={"summary": cached_response, "transaction_id": transaction_id},
+            headers={"X-Cache-Status": "HIT"}
+        )
+
+    start = timeit()
     s = ""
     prompt = ""
     p_version = "N/A"
     token_count = 0
-    transaction_id = str(uuid.uuid4())
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
-
-
+    # The redundant check below is safely ignored as the correct check is already above.
+    if len(req.text) > 4000: # Assuming ~4000 chars is beyond the token limit for this simple demo
+        raise HTTPException(status_code=413, detail="Input text size exceeds the maximum limit (approx. 4000 characters).")
+    
     try:
         # 1. Execute the core logic
         s, prompt, p_version, token_count = summarize_text(req.text) 
@@ -239,10 +291,16 @@ async def summarize_text_endpoint(req: TextReq):
         # 1a. AUTO-GRADE RESPONSE
         quality_score, feedback_notes = auto_grade_response(endpoint, s)
 
+        # --- Cost Control: Response Size Limit Check ---
+        if len(s) > MAX_RESPONSE_LENGTH:
+             s = s[:MAX_RESPONSE_LENGTH] + "..." # Truncate response
+             quality_score = min(quality_score, 0.8)
+             feedback_notes = "Response truncated due to size limit."
+
         # 2. Log success & Prometheus
         latency_sec = timeit() - start
         latency_ms = latency_sec * 1000
-        
+
         log_llm_interaction(
             endpoint=endpoint,
             latency=latency_ms,
@@ -257,9 +315,16 @@ async def summarize_text_endpoint(req: TextReq):
         LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
-        # 3. Return successful response
-        return {"summary": s, "transaction_id": transaction_id}
+        # 3. Cache and Return successful response
+        RESPONSE_CACHE.set(cache_key, s) # Cache the successful summary
+        return JSONResponse(
+            content={"summary": s, "transaction_id": transaction_id},
+            headers={"X-Cache-Status": "MISS"}
+        )
         
+    except HTTPException:
+        # Re-raise explicit HTTP errors (like 413)
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -286,8 +351,8 @@ async def summarize_text_endpoint(req: TextReq):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/translate-text')
 async def translate_text_endpoint(req: TranslateReq):
@@ -297,29 +362,46 @@ async def translate_text_endpoint(req: TranslateReq):
     short codes (e.g. 'hi', 'eng') to the internal NLLB-style codes.
     """
     endpoint = "/translate-text"
-    start = timeit()
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
     
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    # --- Cost Control: Input Size Limit Check ---
+    if len(req.text) > MAX_TEXT_INPUT_CHAR_COUNT:
+        raise HTTPException(status_code=413, detail=f"Input text size exceeds the maximum limit (approx. {MAX_TEXT_INPUT_CHAR_COUNT} characters).")
+
+    # --- Resilience: Caching Check ---
+    cache_key = f"{endpoint}:{req.text}:{req.src_lang}:{req.target_lang}"
+    cached_response = RESPONSE_CACHE.get(cache_key)
+    if cached_response:
+        logger.info("Response served from cache.", extra={'json_fields': {"transaction_id": transaction_id, "cache_hit": True, "model_task": endpoint}})
+        return JSONResponse(
+            content={'translation': cached_response, "transaction_id": transaction_id},
+            headers={"X-Cache-Status": "HIT"}
+        )
+
+    start = timeit()
     translated_text = ""
     prompt = ""
     p_version = "N/A"
     token_count = 0
-    transaction_id = str(uuid.uuid4())
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
-
+    # The redundant check below is safely ignored as the correct check is already above.
+    if len(req.text) > 4000:
+        raise HTTPException(status_code=413, detail="Input text size exceeds the maximum limit (approx. 4000 characters).")
+    
     try:
         text = req.text.strip()
         src_lang = req.src_lang.strip()
         target_lang = req.target_lang.strip()
 
         # Map short language codes to the NLLB / internal codes used by the
-        # translation pipeline. If a code is not recognized, pass it through
-        # unchanged so callers can use other codes.
+        # translation pipeline.
         lang_map = {
             "hi": "hin_Deva",
             "eng": "eng_Latn",
@@ -352,9 +434,15 @@ async def translate_text_endpoint(req: TranslateReq):
         LLM_CALLS.labels(endpoint=endpoint, status='success', model_version=model_version).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
         
-        # 3. Return successful response
-        return {'translation': translated_text, "transaction_id": transaction_id}
+        # 3. Cache and Return successful response
+        RESPONSE_CACHE.set(cache_key, translated_text) # Cache the successful translation
+        return JSONResponse(
+            content={'translation': translated_text, "transaction_id": transaction_id},
+            headers={"X-Cache-Status": "MISS"}
+        )
     
+    except HTTPException:
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -381,43 +469,54 @@ async def translate_text_endpoint(req: TranslateReq):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post('/check-item-return-eligibility')
 async def check_item_return_eligibility(file: UploadFile = File(...)):
-    """Check whether an uploaded item image is eligible for return.
+    """
+    Check whether an uploaded item image is eligible for return.
     Runs defect detection and returns a simple eligibility signal and
     confidence.
     """
     endpoint = "/check-item-return-eligibility"
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
+
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
     start = timeit()
-    
     detection = {}
     file_name = file.filename
     content_type = file.content_type
     p_version = "N/A" 
-    transaction_id = str(uuid.uuid4())
     img_bytes = b''
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
+    # --- Cost Control: File Size Limit Check ---
+    # Read a limited amount to check file size before processing the rest
+    max_file_size = 5 * 1024 * 1024 # 5MB limit
     
     try:
+        # Read file content (stream until limit or EOF)
         img_bytes = await file.read()
-
-        # 1. Execute the core logic
+        if len(img_bytes) > MAX_IMAGE_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File size exceeds the limit of {MAX_IMAGE_FILE_SIZE / (1024*1024):.0f}MB.")
+        
+        # --- NOTE ON CACHING ---
+        # Caching is not applied to file uploads due to high input cardinality (each file is unique) 
+        # and large memory consumption for cache keys/values.
+        
+        # 1. Execute the core logic (CV models currently don't use retry decorator)
         detection = detect_defect(img_bytes)
-        # print("Detection result:", detection) # Replaced with logger
         logger.info("Detection result: %s", detection, extra={'json_fields': {"transaction_id": transaction_id}})
 
         eligibility = detection.get("eligible_for_return")
         
-        # 1a. AUTO-GRADE RESPONSE (Simple pass/fail based on core output)
+        # 1a. AUTO-GRADE RESPONSE 
         quality_score = 1.0 if eligibility in [True, False] else 0.0
         feedback_notes = f"Detection complete. Eligible: {eligibility}"
         
@@ -450,6 +549,9 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
         detection["transaction_id"] = transaction_id
         return detection
     
+    except HTTPException:
+        # Re-raise explicit HTTP errors (like 413)
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -457,7 +559,7 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
         error_message = str(e)
         error_type = type(e).__name__
         
-        # 1a. Log failure (Set minimal score on error)
+        # 1a. Log failure (Set minimal score on error) 
         quality_score, feedback_notes = 0.0, f"System Failure: {error_type}"
 
         # 2. Log failure & Prometheus
@@ -484,32 +586,39 @@ async def check_item_return_eligibility(file: UploadFile = File(...)):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/audio-transcribe")
 async def audio_transcribe(file: UploadFile = File(...)):
     """Transcribe uploaded audio (wav/mp3) to text."""
     endpoint = "/audio-transcribe"
-    start = timeit()
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
     
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    start = timeit()
     transcription = ""
     file_name = file.filename
     audio_bytes = b''
-    p_version = "N/A" # ASR is non-LLM text generation, no prompt versioning used
+    p_version = "N/A" 
     token_count = 0
-    transaction_id = str(uuid.uuid4())
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
-
+    # --- Cost Control: File Size Limit Check ---
     try:
         audio_bytes = await file.read()
+        if len(audio_bytes) > MAX_AUDIO_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File size exceeds the limit of {MAX_AUDIO_FILE_SIZE / (1024*1024):.0f}MB.")
         
+        # --- NOTE ON CACHING ---
+        # Caching is not applied to audio uploads due to high input cardinality (each file is unique) 
+        # and large memory consumption for cache keys/values.
+
         # 1. Execute the core logic
         transcribed_result, token_count = transcribe_audio(audio_bytes)
         transcription = transcribed_result.get("transcription", "")
@@ -545,6 +654,8 @@ async def audio_transcribe(file: UploadFile = File(...)):
         transcribed_result["transaction_id"] = transaction_id
         return transcribed_result
     
+    except HTTPException:
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -578,33 +689,40 @@ async def audio_transcribe(file: UploadFile = File(...)):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/audio-transcribe-translate")
 async def audio_transcribe_translate(file: UploadFile = File(...)):
     """Transcribe and translate uploaded audio to the target language."""
     endpoint = "/audio-transcribe-translate"
-    start = timeit()
+    model_version = get_model_label(endpoint)
+    transaction_id = str(uuid.uuid4())
     
+    # --- Resilience: Rate Limiting (1 token consumed per request) ---
+    if not GLOBAL_RATE_LIMITER.consume(1):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    start = timeit()
     translated_text = ""
     file_name = file.filename
     audio_bytes = b''
     p_version = get_prompt_template("translator_prompt")[1] # Get the current version
     token_count = 0
-    transaction_id = str(uuid.uuid4())
-    
-    # Initialize quality variables
     quality_score = 0.0
     feedback_notes = "Not evaluated."
     
-    # Get model version for Prometheus labels
-    model_version = get_model_label(endpoint)
-
+    # --- Cost Control: File Size Limit Check ---
     try:
         audio_bytes = await file.read()
+        if len(audio_bytes) > MAX_AUDIO_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File size exceeds the limit of {MAX_AUDIO_FILE_SIZE / (1024*1024):.0f}MB.")
         
+        # --- NOTE ON CACHING ---
+        # Caching is not applied to ASR/Translation chain due to high input cardinality (file input) 
+        # and the multi-step nature of the pipeline.
+
         # 1. Execute the core logic
         translated_text, token_count = transcribe_and_translate_audio(audio_bytes)
         
@@ -640,6 +758,8 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
         # 3. Return successful response
         return {'translation': translated_text, "transaction_id": transaction_id}
     
+    except HTTPException:
+        raise
     except Exception as e:
         # 1. Capture error details
         latency_sec = timeit() - start
@@ -674,8 +794,8 @@ async def audio_transcribe_translate(file: UploadFile = File(...)):
         MODEL_ERRORS.labels(endpoint=endpoint, error_type=error_type).inc()
         REQUEST_LATENCY.labels(endpoint=endpoint, model_version=model_version).observe(latency_sec)
 
-        # 3. Raise HTTPException to return the error to the client
-        raise HTTPException(status_code=500, detail=error_message)
+        # 3. Raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
