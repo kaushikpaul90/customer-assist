@@ -22,3 +22,8 @@ opencv-python
 langdetect
 python-json-logger
 prometheus_client
+pydantic
+requests
+coverage
+pytest
+pytest-cov
