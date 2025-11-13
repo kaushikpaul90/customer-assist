@@ -103,7 +103,7 @@ def get_assistant_reply(human_query: str) -> str:
 
 # --- API Endpoint ---
 
-@app.post("/v1/chat", response_model=ChatResponse)
+@app.post("/v1/qa-finetuned-model", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """
     The main conversation endpoint.

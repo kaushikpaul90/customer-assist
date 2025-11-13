@@ -10,14 +10,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
     AutoConfig,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from pathlib import Path
 
 # --- 1. Settings ---
 MODEL_ID = "distilgpt2"
 DATASET_ID = "bitext/Bitext-customer-support-llm-chatbot-training-dataset"
-# OUTPUT_DIR = "../models/distilgpt2_finetuned_adapter"
-BASE_DIR = Path(__file__).resolve().parent.parent  # goes up one level
+BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "models" / "distilgpt2_finetuned_adapter"
 
 EPOCHS = 3
@@ -40,13 +39,25 @@ elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_
 else:
     device = 'cpu'
 
-# --- FIX 1: Force float32 for training stability ---
 model_dtype = torch.float32 
 use_pin_memory = True if device == 'cuda' else False
 
 print(f'Using device: {device} (model dtype={model_dtype})')
 
-# --- 3. Dataset Helpers (from your notebook) ---
+# --- 3. Load Tokenizer (Moved Early) ---
+# We need the tokenizer loaded so we can access its eos_token
+# for the dataset formatting helper.
+print("Loading tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID) 
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+
+# --- UPDATED: Get the EOS token ---
+eos_token = tokenizer.eos_token
+print(f"Tokenizer loaded. EOS token: {eos_token}")
+
+
+# --- 4. Dataset Helpers (Updated) ---
 def safe_load_customer_dataset(dataset_id):
     try:
         ds = load_dataset(dataset_id)
@@ -61,16 +72,16 @@ def safe_load_customer_dataset(dataset_id):
         return Dataset.from_list(samples)
 
 def build_prompt_for_training(row):
-    # Using the Human/Assistant format
+    # --- UPDATED: Added {eos_token} to teach the model when to stop ---
     if 'customer' in row and 'agent' in row:
-        return {'text': f"Human: {row['customer']}\nAssistant: {row['agent']}\n"}
+        return {'text': f"Human: {row['customer']}\nAssistant: {row['agent']}{eos_token}\n"}
     if 'input' in row and 'output' in row:
-        return {'text': f"Human: {row['input']}\nAssistant: {row['output']}\n"}
+        return {'text': f"Human: {row['input']}\nAssistant: {row['output']}{eos_token}\n"}
     if 'instruction' in row and 'response' in row:
-         return {'text': f"Human: {row['instruction']}\nAssistant: {row['response']}\n"}
+         return {'text': f"Human: {row['instruction']}\nAssistant: {row['response']}{eos_token}\n"}
     return {'text': str(row)}
 
-# --- 4. Load and Prepare Dataset ---
+# --- 5. Load and Prepare Dataset (Was Step 4) ---
 print("Loading dataset...")
 raw_ds = safe_load_customer_dataset(DATASET_ID)
 ds = raw_ds.map(build_prompt_for_training)
@@ -87,12 +98,8 @@ else:
 
 print(f"Train size: {len(train_ds)}, Eval size: {len(eval_ds)}")
 
-# --- 5. Load Model and Tokenizer (Only ONCE) ---
-print("Loading base model and tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID) 
-if tokenizer.pad_token is None:
-    tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
-
+# --- 6. Load Model (Was part of Step 5) ---
+print("Loading base model...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     trust_remote_code=False,
@@ -100,10 +107,11 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
     attn_implementation="eager"
 )
+# Resize embeddings *before* PEFT
 model.resize_token_embeddings(len(tokenizer))
 print("Base model loaded.")
 
-# --- 6. Apply LoRA/PEFT ---
+# --- 7. Apply LoRA/PEFT (Was Step 6) ---
 if USE_LORA:
     print("Applying LoRA adapter (PEFT)...")
     lora_config = LoraConfig(
@@ -119,7 +127,7 @@ if USE_LORA:
 else:
     print("Skipping LoRA. Training full model (slower).")
 
-# --- 7. Tokenize Dataset ---
+# --- 8. Tokenize Dataset (Was Step 7) ---
 def tokenize_for_lm(examples):
     texts = [str(t) for t in examples.get('text', [])]
     outputs = tokenizer(
@@ -136,7 +144,7 @@ train_tok = train_ds.map(tokenize_for_lm, batched=True, remove_columns=train_ds.
 eval_tok = eval_ds.map(tokenize_for_lm, batched=True, remove_columns=eval_ds.column_names)
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-# --- 8. Define Trainer ---
+# --- 9. Define Trainer (Was Step 8) ---
 print("Setting up training arguments...")
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -147,7 +155,6 @@ training_args = TrainingArguments(
     save_strategy='epoch',
     logging_steps=10,
     save_total_limit=2,
-    # --- FIX 2: Disable fp16 ---
     fp16=False, 
     remove_unused_columns=False,
     dataloader_pin_memory=use_pin_memory,
@@ -162,29 +169,27 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-# --- 9. !! RUN TRAINING AND SAVE MODEL !! ---
+# --- 10. !! RUN TRAINING AND SAVE MODEL !! (Was Step 9) ---
 print("--- Starting Training ---")
 trainer.train()
 print("--- Training Complete ---")
 
-# Save the final adapter
 print(f"Saving fine-tuned adapter to {OUTPUT_DIR}...")
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 print("Adapter saved successfully.")
 
 
-# --- 10. Test the Fine-Tuned Model ---
+# --- 11. Test the Fine-Tuned Model (Was Step 10) ---
 print("\n--- Testing the Fine-Tuned Model ---")
 
+# Clear memory
 del model
+del trainer
 if device == 'cuda':
     torch.cuda.empty_cache()
 elif device == 'mps':
     torch.mps.empty_cache()
-
-
-from peft import PeftModel
 
 # 1. Load the base model
 base_model = AutoModelForCausalLM.from_pretrained(
@@ -215,11 +220,13 @@ prompt = "Human: I haven't received my refund after 10 days. What should I do?\n
 enc = tokenizer(prompt, return_tensors="pt", return_attention_mask=True).to(device)
 
 with torch.no_grad():
+    # --- UPDATED: Added repetition_penalty and changed temperature ---
     gen_kwargs = dict(
         max_new_tokens=80,
         do_sample=True,
-        temperature=0.22,
+        temperature=0.5,        # Was 0.22
         top_k=40,
+        repetition_penalty=1.15,  # Added this to discourage loops
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
